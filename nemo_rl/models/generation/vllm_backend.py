@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 import torch
 
@@ -24,6 +24,7 @@ except ImportError:
         "covers the vllm dependency. You may have to update nemo_rl/distributed/ray_actor_environment_registry.py. "
         "If you are working interactively, you can install by running  `uv sync --extra vllm` anywhere in the repo."
     )
+
 
 class VllmInternalWorkerExtension:
     def init_collective(
