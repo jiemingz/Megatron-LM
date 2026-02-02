@@ -805,7 +805,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # because the residual is needed in the mlp_bda.
         if self.offload_mlp_norm:
             hidden_states = off_interface.group_commit(
-                hidden_states, name="mlp_norm", forced_released_tensors=[residual]
+                hidden_states, name="mlp_norm", forced_released_tensors=[mlp_output_with_bias[0]]
             )
 
         # Jit compiled function creates 'view' tensor. This tensor
