@@ -182,20 +182,21 @@ class ArgMetadata:
             *self.shape, dtype=self.dtype, device=self.device, requires_grad=self.requires_grad
         )
 
+
 def alloc_tensor_from_graph_mempool(meta: ArgMetadata):
+    """Allocates a tensor into the graph global mempool as defined by the passed in ArgMetadata
+    and returns a strong ref of it."""
+
     torch._C._cuda_beginAllocateCurrentThreadToPool(
-        torch.cuda.current_device(), 
-        CudaGraphManager.global_mempool,
+        torch.cuda.current_device(), CudaGraphManager.global_mempool
     )
     out = meta.zeros_like()
     out.is_from_global_mempool = True
     out.requires_grad_(meta.requires_grad)
 
-    torch._C._cuda_endAllocateToPool(
-        torch.cuda.current_device(), 
-        CudaGraphManager.global_mempool,
-    )
+    torch._C._cuda_endAllocateToPool(torch.cuda.current_device(), CudaGraphManager.global_mempool)
     return out
+
 
 def tree_map(func, tree):
     """
@@ -310,8 +311,10 @@ def _ensure_generator_state_is_cudagraph_safe(gen: torch.Generator) -> torch.Gen
 
 
 def make_weakref(ten, inplace=True):
-    # Weak refs replace tensors with raw-pointer wrappers that do not hold a storage
-    # reference.  Only graph mempool tensors in the graph mempool (e.g. a previous layer's
+    """Weak refs replace tensors with raw-pointer wrappers that do not hold a storage
+    reference."""
+
+    # Only graph mempool tensors in the graph mempool (e.g. a previous layer's
     # output reused as this graph's input) are safe to weak-ref since their memory is
     # driver-pinned with stable addresses. Everything else, including, stray tensors
     # from dataclass __post_init__ side-effects (e.g. seq_idx created by
@@ -319,12 +322,10 @@ def make_weakref(ten, inplace=True):
     # retain strong refs, or it will cause a use-after-free on replay that manifests as a
     # segfault under memory pressure.
     if not (
-        HAVE_TE_GRAPHS
-        and torch.is_tensor(ten)
-        and getattr(ten, "is_from_global_mempool", False)
+        HAVE_TE_GRAPHS and torch.is_tensor(ten) and getattr(ten, "is_from_global_mempool", False)
     ):
         return ten
-    
+
     try:
         wr = make_weak_ref(ten)
         if inplace:
@@ -345,6 +346,8 @@ def make_weakref(ten, inplace=True):
 
 
 def create_strong_ref(ten):
+    """Create a strong reference of the passed in tensor."""
+
     ref = ten.detach()
     if hasattr(ten, "is_from_global_mempool"):
         ref.is_from_global_mempool = ten.is_from_global_mempool
@@ -864,6 +867,7 @@ class _CudaGraphRunner(torch.nn.Module):
                 )
 
         args_to_clear_buffers = []
+
         def _resolve_input_buffer(ten):
             if not isinstance(ten, ArgMetadata):
                 return ten
@@ -1126,12 +1130,14 @@ class _CudaGraphRunner(torch.nn.Module):
                 input_grad.is_from_global_mempool = True
                 input_grad.cg_buffer_metadata = deepcopy(input_tensor.cg_buffer_metadata)
 
-                if input_tensor.cg_buffer_metadata.is_cudagraph_output \
-                    and input_tensor.cg_buffer_metadata.bwd_cudagraph_buffer is None:
-                        buf = create_strong_ref(input_grad)
-                        input_tensor.cg_buffer_metadata.bwd_cudagraph_buffer = buf
-                        buf.cg_buffer_metadata.capture_reuse_count += 1
-                        bwd_buffer_reuse_ref_count += 1
+                if (
+                    input_tensor.cg_buffer_metadata.is_cudagraph_output
+                    and input_tensor.cg_buffer_metadata.bwd_cudagraph_buffer is None
+                ):
+                    buf = create_strong_ref(input_grad)
+                    input_tensor.cg_buffer_metadata.bwd_cudagraph_buffer = buf
+                    buf.cg_buffer_metadata.capture_reuse_count += 1
+                    bwd_buffer_reuse_ref_count += 1
                 self.static_grad_inputs.append(input_grad)
             else:
                 self.static_grad_inputs.append(None)
