@@ -1811,19 +1811,6 @@ class TransformerConfig(ModelParallelConfig):
             if self.moe_expert_rank_capacity_factor is None:
                 self.moe_expert_rank_capacity_factor = 1.0
             replica_errors = []
-            if self.grad_reduce_in_bf16 and not self.ddp_reduce_scatter_with_fp32_accumulation:
-                replica_errors.append(
-                    "--ddp-reduce-scatter-with-fp32-accumulation with " "--grad-reduce-in-bf16"
-                )
-            if (
-                self.grad_reduce_in_bf16
-                and self.expert_gtp_weight_remat_size > 1
-                and not self.gtp_remat_reduce_scatter_with_fp32_accumulation
-            ):
-                replica_errors.append(
-                    "--gtp-remat-reduce-scatter-with-fp32-accumulation with expert GTP and "
-                    "--grad-reduce-in-bf16"
-                )
             replica_mxfp8 = (
                 self.fp8 == "e4m3" and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
             )

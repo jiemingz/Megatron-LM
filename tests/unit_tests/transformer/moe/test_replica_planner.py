@@ -73,6 +73,7 @@ def test_replica_hybridep_binds_the_cutedsl_bridge(
         moe_hybridep_num_blocks_unpermute=5,
         moe_hybridep_num_sms_preprocessing=9,
         grad_reduce_in_bf16=grad_reduce_in_bf16,
+        gtp_remat_reduce_scatter_with_fp32_accumulation=True,
     )
     experts = FakeExperts()
     manager.bind_experts(experts)
@@ -82,6 +83,7 @@ def test_replica_hybridep_binds_the_cutedsl_bridge(
     assert captured["num_experts"] == 8
     assert captured["num_local_experts"] == 2
     assert captured["grad_dtype"] == expected_grad_dtype
+    assert captured["gtp_reduce_scatter_with_fp32_accumulation"] is True
 
 
 def test_replica_hybridep_metadata_uses_routing_map_for_zero_probability_routes():
@@ -239,6 +241,47 @@ def test_replica_fused_wgrad_handoff_preserves_fp32():
     assert parameter.grad.dtype == torch.bfloat16
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_replica_bridge_hands_fp32_outputs_to_gtp_in_backward_order():
+    """Pass combined FP32 gradients to GTP in FC2-to-FC1 backward order."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    plan = object()
+    calls = []
+
+    class FakeGTPLeader:
+        def __init__(self, name):
+            self.name = name
+
+        def wgrad_reduce_scatter(self, grads):
+            calls.append((self.name, tuple(grads)))
+            return tuple(grad.clone() for grad in grads)
+
+    output_grads = tuple(
+        tuple(torch.full((4,), projection + expert / 10, device=device) for expert in range(2))
+        for projection in range(2)
+    )
+    projections = [
+        SimpleNamespace(gtp_leader=FakeGTPLeader(name), parameters=(object(), object()))
+        for name in ("fc1", "fc2")
+    ]
+    bridge = ReplicaCuTeDSLWeightBridge.__new__(ReplicaCuTeDSLWeightBridge)
+    bridge.device = device
+    bridge.projections = projections
+    bridge._grad_reduce_plan = plan
+    bridge._grad_reduce_output_grads = output_grads
+    bridge.grad_reduce_done = torch.cuda.Event()
+    bridge.grad_reduce_done.record()
+
+    reduced_grads = bridge.wait_grad_reduce(plan)
+
+    assert [name for name, _ in calls] == ["fc2", "fc1"]
+    assert all(actual is expected for actual, expected in zip(calls[0][1], output_grads[1]))
+    assert all(actual is expected for actual, expected in zip(calls[1][1], output_grads[0]))
+    assert len(reduced_grads) == 4
+    assert all(grad.dtype == torch.float32 for grad in reduced_grads)
+    assert bridge._grad_reduce_output_grads is None
+
+
 def test_replica_planner_slots_preserve_two_outstanding_forwards(monkeypatch):
     """Repeated MTP forwards must retain disjoint plans until their own backwards."""
     from megatron.core.transformer.moe import token_dispatcher
@@ -252,8 +295,7 @@ def test_replica_planner_slots_preserve_two_outstanding_forwards(monkeypatch):
                 (kwargs["num_tokens"], kwargs["router_topk"]), dtype=torch.int64
             ),
             experts_to_copy=torch.empty(
-                (kwargs["ep_size"], kwargs["num_experts"] // kwargs["ep_size"]),
-                dtype=torch.int32,
+                (kwargs["ep_size"], kwargs["num_experts"] // kwargs["ep_size"]), dtype=torch.int32
             ),
         )
         allocated.append(workspace)
@@ -883,7 +925,9 @@ def _run_replica_hybridep_full_layer_parity(
                 assert bridge.workspace.weight_handle is not None
                 for projection in bridge.projections:
                     for virtual in projection.virtual_weight:
-                        assert virtual._rowwise_data.data_ptr() == virtual._columnwise_data.data_ptr()
+                        assert (
+                            virtual._rowwise_data.data_ptr() == virtual._columnwise_data.data_ptr()
+                        )
             if gtp and mxfp8:
                 # GTP gather outputs replace these aliases before execution; no
                 # second full native row/column staging allocation is retained.

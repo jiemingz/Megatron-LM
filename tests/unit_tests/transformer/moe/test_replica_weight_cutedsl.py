@@ -102,13 +102,14 @@ def _summarize(samples: list[float]) -> dict[str, float]:
 
 @pytest.mark.internal
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not HAVE_CUTEDSL,
-    reason="CUDA and CuTeDSL are required",
+    not torch.cuda.is_available() or not HAVE_CUTEDSL, reason="CUDA and CuTeDSL are required"
 )
 @pytest.mark.parametrize(
-    "grad_dtype", [torch.float32, torch.bfloat16], ids=["fp32-grad", "bf16-grad"]
+    ("grad_dtype", "use_fp32_output"),
+    [(torch.float32, False), (torch.bfloat16, False), (torch.bfloat16, True)],
+    ids=["fp32-grad", "bf16-grad", "bf16-grad-fp32-output"],
 )
-def test_replica_weight_kernels_virtual_only_cases(grad_dtype):
+def test_replica_weight_kernels_virtual_only_cases(grad_dtype, use_fp32_output):
     """Cover owner-push, sparse clearing, zero work, and unequal FC shapes."""
     if int(os.environ.get("WORLD_SIZE", "1")) != 4:
         pytest.skip("Replica weight kernel coverage requires a 4-rank torchrun launch")
@@ -123,9 +124,7 @@ def test_replica_weight_kernels_virtual_only_cases(grad_dtype):
     # transactions as the production 2048x640 expert projections.
     member_numels = (262144, 524288)
     arena_numel = num_local_experts * sum(member_numels)
-    weight_storage, weight_handle = _allocate_symmetric(
-        arena_numel, torch.bfloat16, group
-    )
+    weight_storage, weight_handle = _allocate_symmetric(arena_numel, torch.bfloat16, group)
     grad_storage, grad_handle = _allocate_symmetric(arena_numel, grad_dtype, group)
     weight_arena = weight_storage
     grad_arena = grad_storage
@@ -144,6 +143,12 @@ def test_replica_weight_kernels_virtual_only_cases(grad_dtype):
         torch.empty(num_local_experts, member, dtype=grad_dtype, device=device)
         for member in member_numels
     )
+    output_grads = (
+        tuple(torch.empty_like(grad, dtype=torch.float32) for grad in main_grads)
+        if use_fp32_output
+        else None
+    )
+    output_dtype = torch.float32 if output_grads is not None else grad_dtype
     weight_grid_barrier = torch.zeros(1, dtype=torch.int32, device=device)
     grad_grid_barrier = torch.zeros(1, dtype=torch.int32, device=device)
     compile_replica_weight_kernels(
@@ -153,12 +158,11 @@ def test_replica_weight_kernels_virtual_only_cases(grad_dtype):
         num_sms=4,
         device_index=device.index,
         grad_dtype=grad_dtype,
+        output_grad_dtype=output_dtype,
     )
 
     def make_plan(placement: str, slots: tuple[int, ...]) -> torch.Tensor:
-        plan = torch.full(
-            (world_size, num_local_experts), -1, dtype=torch.int32, device=device
-        )
+        plan = torch.full((world_size, num_local_experts), -1, dtype=torch.int32, device=device)
         if placement == "asymmetric":
             plan[0, slots[0]] = num_local_experts
             plan[1, slots[0]] = 2 * num_local_experts
@@ -221,7 +225,7 @@ def test_replica_weight_kernels_virtual_only_cases(grad_dtype):
                 )
                 for slot in local_slots:
                     view[slot].fill_(projection * 1000 + rank * 100 + slot + 1)
-                main_grads[projection].fill_(projection + 5)
+                main_grads[projection].fill_(projection + 5.03125)
             torch.cuda.synchronize(device)
             dist.barrier(group=group, device_ids=[device.index])
             launch_replica_grad_reduce(
@@ -236,15 +240,16 @@ def test_replica_weight_kernels_virtual_only_cases(grad_dtype):
                 num_local_experts=num_local_experts,
                 member_numels=member_numels,
                 num_sms=4,
+                output_grads=output_grads,
             )
             torch.cuda.synchronize(device)
             plan_rows = plan.tolist()
             for projection, member in enumerate(member_numels):
+                native_value = torch.tensor(
+                    projection + 5.03125, dtype=grad_dtype, device=device
+                ).item()
                 expected_fp32 = torch.full(
-                    (num_local_experts,),
-                    torch.tensor(projection + 5, dtype=grad_dtype).item(),
-                    dtype=torch.float32,
-                    device=device,
+                    (num_local_experts,), native_value, dtype=torch.float32, device=device
                 )
                 for local_expert in range(num_local_experts):
                     semantic_expert = rank * num_local_experts + local_expert
@@ -256,7 +261,20 @@ def test_replica_weight_kernels_virtual_only_cases(grad_dtype):
                                     dtype=grad_dtype,
                                     device=device,
                                 )
-                expected = expected_fp32.to(grad_dtype)
+                if output_grads is not None:
+                    if rank == 0 and placement == "all-peers" and len(slots) == num_local_experts:
+                        # Ensure this case distinguishes the FP32 result from its BF16 cast.
+                        assert expected_fp32[0] != expected_fp32[0].to(torch.bfloat16).float()
+                    check_close(
+                        output_grads[projection][:, 0],
+                        expected_fp32,
+                        f"{placement}/{slots} projection {projection} FP32 result",
+                    )
+                    expected = torch.full(
+                        (num_local_experts,), native_value, dtype=grad_dtype, device=device
+                    )
+                else:
+                    expected = expected_fp32.to(grad_dtype)
                 check_close(
                     main_grads[projection][:, 0],
                     expected,
