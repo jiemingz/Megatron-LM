@@ -471,9 +471,9 @@ class _PrefetchResources:
 class _CuTeDSLReplicaProjection:
     """One projection and its stable native/virtual runtime storage.
 
-    Expert backward writes native and replica wgrads into bridge-owned staging.
-    The replica reduction accumulates the virtual contributions into the native
-    staging, which is then handed to the optimizer parameters through autograd.
+    Expert backward writes native and replica wgrads into bridge-owned staging. Replica
+    reduction writes native-dtype results back to that staging, or writes FP32 results to
+    temporary tensors passed directly to GTP reduce-scatter.
     """
 
     name: str
@@ -753,6 +753,7 @@ class _ReplicaCuTeDSLWorkspaceConfig:
     rowwise_scale_shapes: tuple[tuple[int, ...], tuple[int, ...]] | None
     columnwise_scale_shapes: tuple[tuple[int, ...], tuple[int, ...]] | None
     grad_dtype: torch.dtype
+    output_grad_dtype: torch.dtype
     num_sms: int
 
 
@@ -784,6 +785,7 @@ class _ReplicaCuTeDSLWorkspace:
         self.rowwise_scale_shapes = config.rowwise_scale_shapes
         self.columnwise_scale_shapes = config.columnwise_scale_shapes
         self.grad_dtype = config.grad_dtype
+        self.output_grad_dtype = config.output_grad_dtype
         self.rowwise_scale_numels = (
             tuple(math.prod(shape) for shape in self.rowwise_scale_shapes)
             if self.rowwise_scale_shapes is not None
@@ -870,6 +872,7 @@ class _ReplicaCuTeDSLWorkspace:
             num_sms=self.num_sms,
             device_index=device_index,
             grad_dtype=self.grad_dtype,
+            output_grad_dtype=self.output_grad_dtype,
             rowwise_scale_numels=self.rowwise_scale_numels,
             columnwise_scale_numels=self.columnwise_scale_numels,
         )
@@ -993,6 +996,7 @@ def _get_replica_cutedsl_workspace(
     rowwise_scale_shapes: tuple[tuple[int, ...], tuple[int, ...]] | None,
     columnwise_scale_shapes: tuple[tuple[int, ...], tuple[int, ...]] | None,
     grad_dtype: torch.dtype,
+    output_grad_dtype: torch.dtype,
     num_sms: int | None,
 ) -> _ReplicaCuTeDSLWorkspace:
     """Return the one fixed-shape workspace owned by an EP group and device."""
@@ -1000,6 +1004,11 @@ def _get_replica_cutedsl_workspace(
         raise ValueError(
             "Replica CuTeDSL gradients must use torch.float32 or torch.bfloat16, "
             f"got {grad_dtype}."
+        )
+    if output_grad_dtype not in (grad_dtype, torch.float32):
+        raise ValueError(
+            "Replica CuTeDSL output gradients must use the native gradient dtype or FP32, "
+            f"got native={grad_dtype}, output={output_grad_dtype}."
         )
     requested_sms = 32 if num_sms is None else int(num_sms)
     device_sms = torch.cuda.get_device_properties(device).multi_processor_count
@@ -1014,6 +1023,7 @@ def _get_replica_cutedsl_workspace(
         rowwise_scale_shapes,
         columnwise_scale_shapes,
         grad_dtype,
+        output_grad_dtype,
         effective_sms,
     )
     key = (id(group), device.index)
@@ -1037,6 +1047,7 @@ class ReplicaCuTeDSLWeightBridge:
         num_experts: int,
         num_local_experts: int,
         grad_dtype: torch.dtype = torch.float32,
+        gtp_reduce_scatter_with_fp32_accumulation: bool,
         num_sms: int | None = None,
     ) -> None:
         self.group = group
@@ -1047,6 +1058,7 @@ class ReplicaCuTeDSLWeightBridge:
         self.last_plan = None
         self._prefetch_plan = None
         self._grad_reduce_plan = None
+        self._grad_reduce_output_grads = None
         self._experts_ref = weakref.ref(experts)
         self._destroyed = False
 
@@ -1057,9 +1069,17 @@ class ReplicaCuTeDSLWeightBridge:
                 f"num_local_experts={self.num_local_experts}."
             )
         projection_specs, self.device = _collect_replica_projection_specs(
-            experts,
-            num_local_experts=self.num_local_experts,
-            backend_name="Replica-CuTeDSL",
+            experts, num_local_experts=self.num_local_experts, backend_name="Replica-CuTeDSL"
+        )
+        all_projections_use_gtp = all(spec.gtp_leader is not None for spec in projection_specs)
+        output_grad_dtype = (
+            torch.float32
+            if (
+                all_projections_use_gtp
+                and grad_dtype == torch.bfloat16
+                and gtp_reduce_scatter_with_fp32_accumulation
+            )
+            else grad_dtype
         )
         member_shapes = tuple(spec.member_shape for spec in projection_specs)
         self.weight_format = projection_specs[0].weight_format
@@ -1083,6 +1103,7 @@ class ReplicaCuTeDSLWeightBridge:
             rowwise_scale_shapes=rowwise_scale_shapes,
             columnwise_scale_shapes=columnwise_scale_shapes,
             grad_dtype=grad_dtype,
+            output_grad_dtype=output_grad_dtype,
             num_sms=num_sms,
         )
         self.prefetch_ready = torch.cuda.Event()
@@ -1381,20 +1402,36 @@ class ReplicaCuTeDSLWeightBridge:
     @torch.no_grad()
     @nvtx_decorator(message="replica_cutedsl_grad_reduce_start")
     def start_grad_reduce(self, plan: ReplicaPlan) -> None:
-        """Enqueue replica-gradient reduction into native wgrad staging."""
+        """Enqueue replica-gradient reduction into the native or FP32 output buffers."""
         if self._grad_reduce_plan is not None:
             raise RuntimeError("Replica CuTeDSL gradient reduction is already outstanding.")
         self._validate_plan(plan)
         self.prepare_runtime_parameters()
+
+        output_grad_storage = None
+        if self.workspace.output_grad_dtype == self.workspace.grad_dtype:
+            output_grads = tuple(projection._native_grads() for projection in self.projections)
+        else:
+            output_grad_storage = tuple(
+                torch.empty(
+                    (len(projection.parameters), *projection.member_shape),
+                    dtype=self.workspace.output_grad_dtype,
+                    device=self.device,
+                )
+                for projection in self.projections
+            )
+            output_grads = tuple(tuple(storage) for storage in output_grad_storage)
+
+        # Keep the output views alive through the side-stream kernel. GTP retains or copies the
+        # FP32 payloads before wait_grad_reduce releases these references.
+        self._grad_reduce_output_grads = output_grads
         current_stream = torch.cuda.current_stream(self.device)
         self.grad_reduce_ready.record(current_stream)
         self.workspace.grad_stream.wait_event(self.grad_reduce_ready)
         with torch.cuda.stream(self.workspace.grad_stream):
             launch_replica_grad_reduce(
                 arena=self.workspace.grad_arena,
-                native_grads=tuple(
-                    projection.native_grad_bases for projection in self.projections
-                ),
+                native_grads=tuple(projection.native_grad_bases for projection in self.projections),
                 peer_bases=self.workspace.grad_handle.buffer_ptrs_dev,
                 signal_bases=self.workspace.grad_handle.signal_pad_ptrs_dev,
                 experts_to_copy=plan.experts_to_copy,
@@ -1404,6 +1441,7 @@ class ReplicaCuTeDSLWeightBridge:
                 num_local_experts=self.num_local_experts,
                 member_numels=self.workspace.member_numels,
                 num_sms=self.workspace.num_sms,
+                output_grads=output_grad_storage,
             )
             self.grad_reduce_done.record(self.workspace.grad_stream)
         self._grad_reduce_plan = plan
@@ -1418,6 +1456,9 @@ class ReplicaCuTeDSLWeightBridge:
             raise RuntimeError("Replica CuTeDSL grad-reduction plan changed while outstanding.")
         torch.cuda.current_stream(self.device).wait_event(self.grad_reduce_done)
         self._grad_reduce_plan = None
+        output_grads = self._grad_reduce_output_grads
+        if output_grads is None:
+            raise RuntimeError("Replica CuTeDSL lost its gradient-reduction outputs.")
 
         reduced_gtp_grads = [None] * len(self.projections)
         # Expert backward computes FC2 before FC1. Preserve that reverse order
@@ -1427,13 +1468,13 @@ class ReplicaCuTeDSLWeightBridge:
             if projection.gtp_leader is None:
                 continue
             reduced_gtp_grads[projection_index] = projection.gtp_leader.wgrad_reduce_scatter(
-                list(projection._native_grads())
+                list(output_grads[projection_index])
             )
 
         source_grads = []
         for projection_index, projection in enumerate(self.projections):
             if projection.gtp_leader is None:
-                source_grads.extend(projection._native_grads())
+                source_grads.extend(output_grads[projection_index])
                 continue
             reduced_grads = reduced_gtp_grads[projection_index]
             if not isinstance(reduced_grads, (list, tuple)):
@@ -1443,6 +1484,7 @@ class ReplicaCuTeDSLWeightBridge:
                     "GTP returned a different number of reduced wgrads than source parameters."
                 )
             source_grads.extend(reduced_grads)
+        self._grad_reduce_output_grads = None
         return tuple(source_grads)
 
     def destroy(self) -> None:

@@ -1335,8 +1335,9 @@ class _ReplicaPlannedManagerMixin:
             group=self.group,
             num_experts=self.semantic_num_experts,
             num_local_experts=self.num_owned_experts,
-            grad_dtype=(
-                torch.bfloat16 if self.config.grad_reduce_in_bf16 else torch.float32
+            grad_dtype=(torch.bfloat16 if self.config.grad_reduce_in_bf16 else torch.float32),
+            gtp_reduce_scatter_with_fp32_accumulation=(
+                self.config.gtp_remat_reduce_scatter_with_fp32_accumulation
             ),
             num_sms=self.config.moe_flex_dispatcher_num_sms,
         )
