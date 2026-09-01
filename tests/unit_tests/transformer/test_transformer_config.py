@@ -98,18 +98,20 @@ def test_replica_hybridep_rejects_single_grouped_weight():
         _make_replica_hybridep_config(moe_single_grouped_weight=True)
 
 
-def test_replica_hybridep_bf16_grad_reduce_requires_ddp_fp32_accumulation():
-    with pytest.raises(ValueError, match="ddp-reduce-scatter-with-fp32-accumulation"):
-        _make_replica_hybridep_config(grad_reduce_in_bf16=True)
+def test_replica_hybridep_bf16_grad_reduce_allows_native_ddp_accumulation():
+    config = _make_replica_hybridep_config(grad_reduce_in_bf16=True)
+
+    assert config.ddp_reduce_scatter_with_fp32_accumulation is False
 
 
-def test_replica_hybridep_bf16_grad_reduce_requires_gtp_fp32_accumulation_with_gtp():
-    with pytest.raises(ValueError, match="gtp-remat-reduce-scatter-with-fp32-accumulation"):
-        _make_replica_hybridep_config(
-            grad_reduce_in_bf16=True,
-            ddp_reduce_scatter_with_fp32_accumulation=True,
-            expert_tensor_parallel_num_weight_shards=2,
-        )
+def test_replica_hybridep_bf16_grad_reduce_allows_native_gtp_accumulation():
+    config = _make_replica_hybridep_config(
+        grad_reduce_in_bf16=True,
+        ddp_reduce_scatter_with_fp32_accumulation=True,
+        expert_tensor_parallel_num_weight_shards=2,
+    )
+
+    assert config.gtp_remat_reduce_scatter_with_fp32_accumulation is False
 
 
 @pytest.mark.parametrize("expert_gtp", [False, True])

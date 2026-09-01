@@ -1335,7 +1335,10 @@ class _ReplicaPlannedManagerMixin:
             group=self.group,
             num_experts=self.semantic_num_experts,
             num_local_experts=self.num_owned_experts,
-            grad_dtype=(
+            # Keep the native and replica expert wgrads in FP32 until the replica reduction has
+            # combined them. The output follows the outer GTP/DDP gradient policy.
+            grad_dtype=torch.float32,
+            output_grad_dtype=(
                 torch.bfloat16 if self.config.grad_reduce_in_bf16 else torch.float32
             ),
             num_sms=self.config.moe_flex_dispatcher_num_sms,

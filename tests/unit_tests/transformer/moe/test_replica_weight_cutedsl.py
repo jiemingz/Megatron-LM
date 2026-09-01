@@ -102,13 +102,19 @@ def _summarize(samples: list[float]) -> dict[str, float]:
 
 @pytest.mark.internal
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not HAVE_CUTEDSL,
-    reason="CUDA and CuTeDSL are required",
+    not torch.cuda.is_available() or not HAVE_CUTEDSL, reason="CUDA and CuTeDSL are required"
 )
 @pytest.mark.parametrize(
-    "grad_dtype", [torch.float32, torch.bfloat16], ids=["fp32-grad", "bf16-grad"]
+    ("grad_dtype", "output_dtype", "discrete_output"),
+    [
+        (torch.float32, torch.float32, False),
+        (torch.bfloat16, torch.bfloat16, False),
+        (torch.float32, torch.bfloat16, False),
+        (torch.float32, torch.bfloat16, True),
+    ],
+    ids=["fp32-in-place", "bf16-in-place", "fp32-to-bf16", "fp32-to-bf16-discrete"],
 )
-def test_replica_weight_kernels_virtual_only_cases(grad_dtype):
+def test_replica_weight_kernels_virtual_only_cases(grad_dtype, output_dtype, discrete_output):
     """Cover owner-push, sparse clearing, zero work, and unequal FC shapes."""
     if int(os.environ.get("WORLD_SIZE", "1")) != 4:
         pytest.skip("Replica weight kernel coverage requires a 4-rank torchrun launch")
@@ -123,9 +129,7 @@ def test_replica_weight_kernels_virtual_only_cases(grad_dtype):
     # transactions as the production 2048x640 expert projections.
     member_numels = (262144, 524288)
     arena_numel = num_local_experts * sum(member_numels)
-    weight_storage, weight_handle = _allocate_symmetric(
-        arena_numel, torch.bfloat16, group
-    )
+    weight_storage, weight_handle = _allocate_symmetric(arena_numel, torch.bfloat16, group)
     grad_storage, grad_handle = _allocate_symmetric(arena_numel, grad_dtype, group)
     weight_arena = weight_storage
     grad_arena = grad_storage
@@ -144,6 +148,35 @@ def test_replica_weight_kernels_virtual_only_cases(grad_dtype):
         torch.empty(num_local_experts, member, dtype=grad_dtype, device=device)
         for member in member_numels
     )
+    if output_dtype == grad_dtype:
+        assert not discrete_output
+        output_grads = None
+    elif discrete_output:
+        output_grads = tuple(
+            tuple(
+                torch.empty(member, dtype=output_dtype, device=device)
+                for _ in range(num_local_experts)
+            )
+            for member in member_numels
+        )
+    else:
+        output_grads = tuple(torch.empty_like(grad, dtype=output_dtype) for grad in main_grads)
+    test_fp32_to_bf16 = grad_dtype == torch.float32 and output_dtype == torch.bfloat16
+
+    def native_value(projection):
+        return 1000.5 if test_fp32_to_bf16 else projection + 5.03125
+
+    def replica_value(projection, source_rank, slot):
+        return -999.5 if test_fp32_to_bf16 else projection * 1000 + source_rank * 100 + slot + 1
+
+    if test_fp32_to_bf16:
+        # Early BF16 stores would cancel these inputs to zero. Keeping both in FP32 until the
+        # combined output store produces one, so this vector detects the precision boundary.
+        early_bf16_sum = torch.tensor(1000.5, dtype=torch.bfloat16) + torch.tensor(
+            -999.5, dtype=torch.bfloat16
+        )
+        assert early_bf16_sum.item() == 0
+        assert torch.tensor(1000.5 - 999.5, dtype=torch.bfloat16).item() == 1
     weight_grid_barrier = torch.zeros(1, dtype=torch.int32, device=device)
     grad_grid_barrier = torch.zeros(1, dtype=torch.int32, device=device)
     compile_replica_weight_kernels(
@@ -153,12 +186,11 @@ def test_replica_weight_kernels_virtual_only_cases(grad_dtype):
         num_sms=4,
         device_index=device.index,
         grad_dtype=grad_dtype,
+        output_grad_dtype=output_dtype,
     )
 
     def make_plan(placement: str, slots: tuple[int, ...]) -> torch.Tensor:
-        plan = torch.full(
-            (world_size, num_local_experts), -1, dtype=torch.int32, device=device
-        )
+        plan = torch.full((world_size, num_local_experts), -1, dtype=torch.int32, device=device)
         if placement == "asymmetric":
             plan[0, slots[0]] = num_local_experts
             plan[1, slots[0]] = 2 * num_local_experts
@@ -220,8 +252,8 @@ def test_replica_weight_kernels_virtual_only_cases(grad_dtype):
                     num_local_experts, member
                 )
                 for slot in local_slots:
-                    view[slot].fill_(projection * 1000 + rank * 100 + slot + 1)
-                main_grads[projection].fill_(projection + 5)
+                    view[slot].fill_(replica_value(projection, rank, slot))
+                main_grads[projection].fill_(native_value(projection))
             torch.cuda.synchronize(device)
             dist.barrier(group=group, device_ids=[device.index])
             launch_replica_grad_reduce(
@@ -236,15 +268,16 @@ def test_replica_weight_kernels_virtual_only_cases(grad_dtype):
                 num_local_experts=num_local_experts,
                 member_numels=member_numels,
                 num_sms=4,
+                output_grads=output_grads,
             )
             torch.cuda.synchronize(device)
             plan_rows = plan.tolist()
             for projection, member in enumerate(member_numels):
+                native = torch.tensor(
+                    native_value(projection), dtype=grad_dtype, device=device
+                ).item()
                 expected_fp32 = torch.full(
-                    (num_local_experts,),
-                    torch.tensor(projection + 5, dtype=grad_dtype).item(),
-                    dtype=torch.float32,
-                    device=device,
+                    (num_local_experts,), native, dtype=torch.float32, device=device
                 )
                 for local_expert in range(num_local_experts):
                     semantic_expert = rank * num_local_experts + local_expert
@@ -252,11 +285,26 @@ def test_replica_weight_kernels_virtual_only_cases(grad_dtype):
                         for slot in range(num_local_experts):
                             if plan_rows[destination][slot] == semantic_expert:
                                 expected_fp32[local_expert] += torch.tensor(
-                                    projection * 1000 + destination * 100 + slot + 1,
+                                    replica_value(projection, destination, slot),
                                     dtype=grad_dtype,
                                     device=device,
                                 )
-                expected = expected_fp32.to(grad_dtype)
+                if output_grads is not None:
+                    expected_output = expected_fp32.to(output_dtype)
+                    check_close(
+                        (
+                            torch.stack(tuple(output[0] for output in output_grads[projection]))
+                            if discrete_output
+                            else output_grads[projection][:, 0]
+                        ),
+                        expected_output,
+                        f"{placement}/{slots} projection {projection} output",
+                    )
+                    expected = torch.full(
+                        (num_local_experts,), native, dtype=grad_dtype, device=device
+                    )
+                else:
+                    expected = expected_fp32.to(grad_dtype)
                 check_close(
                     main_grads[projection][:, 0],
                     expected,

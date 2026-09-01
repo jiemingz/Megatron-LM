@@ -623,12 +623,12 @@ class _ReplicaWeightPushKernel:
 
 
 class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
-    """Accumulate FP32 or BF16 replica gradients and clear used local slots."""
+    """Accumulate replica gradients, convert the combined output, and clear used slots."""
 
     BULK_ELEMENTS = 4096
     BULKS_PER_CHUNK = 4
     CHUNK_ELEMENTS = BULK_ELEMENTS * BULKS_PER_CHUNK
-    BF16_CONSUMER_WARPS = 16
+    REGISTER_CONSUMER_WARPS = 16
     # Transport the chunks in several passes over disjoint ranges. The
     # cross-rank barrier closing a pass proves every owner has read that range,
     # so the next pass can zero the local slots behind it while it waits on the
@@ -640,7 +640,16 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
     # behind the same asynchronous-copy engine.
     CLEAR_STORE_BITS = 128
 
-    def __init__(self, *, grad_dtype: torch.dtype, **kwargs) -> None:
+    def __init__(
+        self, *, grad_dtype: torch.dtype, output_grad_dtype: torch.dtype, **kwargs
+    ) -> None:
+        if output_grad_dtype != grad_dtype and (
+            grad_dtype != torch.float32 or output_grad_dtype != torch.bfloat16
+        ):
+            raise ValueError(
+                "Replica CuTeDSL output gradients must match the staging dtype or convert "
+                "FP32 staging to BF16."
+            )
         if grad_dtype == torch.bfloat16:
             self.CHUNK_ELEMENTS = math.gcd(
                 2 * self.CHUNK_ELEMENTS,
@@ -650,11 +659,14 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
         super().__init__(**kwargs)
         self.is_bf16 = grad_dtype == torch.bfloat16
         self.grad_type = BFloat16 if self.is_bf16 else Float32
+        self.output_grad_type = BFloat16 if output_grad_dtype == torch.bfloat16 else Float32
+        self.output_is_separate = output_grad_dtype != grad_dtype
+        self.use_register_accumulator = self.is_bf16 or self.output_is_separate
         self.element_bytes = 2 if self.is_bf16 else 4
         self.clear_vector = self.CLEAR_STORE_BITS // (8 * self.element_bytes)
         # One producer warp, the reduction warps, and one warp that retires the
         # slots the previous pass drained.
-        self.consumer_warps = self.BF16_CONSUMER_WARPS if self.is_bf16 else 1
+        self.consumer_warps = self.REGISTER_CONSUMER_WARPS if self.use_register_accumulator else 1
         self.num_threads = 32 * (self.consumer_warps + 2)
 
     def _smem_bytes(self) -> int:
@@ -716,6 +728,8 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
         arena_ptr: cute.Pointer,
         fc1_native_grad_bases_ptr: cute.Pointer,
         fc2_native_grad_bases_ptr: cute.Pointer,
+        fc1_output_grad_bases_ptr: cute.Pointer,
+        fc2_output_grad_bases_ptr: cute.Pointer,
         peer_base_ptr: cute.Pointer,
         signal_base_ptr: cute.Pointer,
         experts_ptr: cute.Pointer,
@@ -728,6 +742,8 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
         arena = _tensor_1d(arena_ptr, fc1_numel + fc2_numel)
         fc1_native_grad_bases = _tensor_1d(fc1_native_grad_bases_ptr, self.num_local_experts)
         fc2_native_grad_bases = _tensor_1d(fc2_native_grad_bases_ptr, self.num_local_experts)
+        fc1_output_grad_bases = _tensor_1d(fc1_output_grad_bases_ptr, self.num_local_experts)
+        fc2_output_grad_bases = _tensor_1d(fc2_output_grad_bases_ptr, self.num_local_experts)
         peer_bases = _tensor_1d(peer_base_ptr, self.world_size)
         signal_bases = _tensor_1d(signal_base_ptr, self.world_size)
         experts = _tensor_1d(experts_ptr, self.world_size * self.num_local_experts)
@@ -735,6 +751,8 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
             arena,
             fc1_native_grad_bases,
             fc2_native_grad_bases,
+            fc1_output_grad_bases,
+            fc2_output_grad_bases,
             peer_bases,
             signal_bases,
             experts,
@@ -754,6 +772,8 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
         arena: cute.Tensor,
         fc1_native_grad_bases: cute.Tensor,
         fc2_native_grad_bases: cute.Tensor,
+        fc1_output_grad_bases: cute.Tensor,
+        fc2_output_grad_bases: cute.Tensor,
         peer_bases: cute.Tensor,
         signal_bases: cute.Tensor,
         experts: cute.Tensor,
@@ -859,11 +879,13 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
                     member_numel = cutlass.const_expr(self.fc1_member_numel)
                     virtual_projection_base = Int64(0)
                     native_grad_bases = fc1_native_grad_bases
+                    output_grad_bases = fc1_output_grad_bases
                     if expert_chunk >= self.fc1_member_chunks:
                         member_chunk = expert_chunk - self.fc1_member_chunks
                         member_numel = cutlass.const_expr(self.fc2_member_numel)
                         virtual_projection_base = Int64(virtual_fc1_numel)
                         native_grad_bases = fc2_native_grad_bases
+                        output_grad_bases = fc2_output_grad_bases
                     member_offset = Int64(member_chunk * self.CHUNK_ELEMENTS)
 
                     if warp == 0:
@@ -898,17 +920,27 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
                         for destination in cutlass.range_constexpr(self.world_size):
                             if matches[local_expert * self.world_size + destination] >= Int32(0):
                                 source_count += Int32(1)
-                        if source_count > Int32(0):
-                            native_destination = cute.make_ptr(
+                        # A separate output must also copy experts with no replica sources.
+                        if source_count > Int32(0) or cutlass.const_expr(self.output_is_separate):
+                            native_grad = cute.make_ptr(
                                 self.grad_type,
                                 native_grad_bases[local_expert],
                                 cute.AddressSpace.gmem,
                                 assumed_align=16,
                             )
-                            native_destination = _tensor_1d(
-                                native_destination + member_offset, self.CHUNK_ELEMENTS
+                            native_grad = _tensor_1d(
+                                native_grad + member_offset, self.CHUNK_ELEMENTS
                             )
-                            if cutlass.const_expr(self.is_bf16):
+                            output_grad = cute.make_ptr(
+                                self.output_grad_type,
+                                output_grad_bases[local_expert],
+                                cute.AddressSpace.gmem,
+                                assumed_align=16,
+                            )
+                            output_grad = _tensor_1d(
+                                output_grad + member_offset, self.CHUNK_ELEMENTS
+                            )
+                            if cutlass.const_expr(self.use_register_accumulator):
                                 consumer_thread = tid - Int32(32)
                                 consumer_threads = cutlass.const_expr(32 * self.consumer_warps)
                                 thread_elements = cutlass.const_expr(
@@ -917,7 +949,7 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
                                 accumulator = cute.make_rmem_tensor((thread_elements,), Float32)
                                 for register in cutlass.range_constexpr(thread_elements):
                                     element = consumer_thread + register * consumer_threads
-                                    accumulator[register] = Float32(native_destination[element])
+                                    accumulator[register] = Float32(native_grad[element])
                                 for _source_index in cutlass.range(source_count, unroll=1):
                                     load_pipe.consumer_wait(consume_state)
                                     stage = stage_smem[(None, consume_state.index)]
@@ -926,11 +958,11 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
                                         accumulator[register] += Float32(stage[element])
                                     load_pipe.consumer_release(consume_state)
                                     consume_state.advance()
-                                # Round only on the final store; peer traffic and persistent
-                                # storage remain BF16 while local additions use FP32.
                                 for register in cutlass.range_constexpr(thread_elements):
                                     element = consumer_thread + register * consumer_threads
-                                    native_destination[element] = BFloat16(accumulator[register])
+                                    output_grad[element] = self.output_grad_type(
+                                        accumulator[register]
+                                    )
                             else:
                                 for _source_index in cutlass.range(source_count, unroll=1):
                                     load_pipe.consumer_wait(consume_state)
@@ -939,8 +971,7 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
                                             stage = stage_smem[(None, consume_state.index)]
                                             _cp_reduce_async_bulk_add_f32(
                                                 stage.iterator + bulk * self.BULK_ELEMENTS,
-                                                native_destination.iterator
-                                                + bulk * self.BULK_ELEMENTS,
+                                                output_grad.iterator + bulk * self.BULK_ELEMENTS,
                                                 self.BULK_ELEMENTS * 4,
                                             )
                                         cute.arch.cp_async_bulk_commit_group()
@@ -1064,6 +1095,7 @@ def _get_compiled_grad_reduce(
     num_sms: int,
     device_index: int,
     grad_dtype: torch.dtype = torch.float32,
+    output_grad_dtype: torch.dtype | None = None,
 ):
     _validate_compile_shape(
         world_size, num_local_experts, fc1_member_numel, fc2_member_numel, num_sms
@@ -1073,9 +1105,19 @@ def _get_compiled_grad_reduce(
             "Replica CuTeDSL gradients must use torch.float32 or torch.bfloat16, "
             f"got {grad_dtype}."
         )
+    if output_grad_dtype is None:
+        output_grad_dtype = grad_dtype
+    if output_grad_dtype != grad_dtype and (
+        grad_dtype != torch.float32 or output_grad_dtype != torch.bfloat16
+    ):
+        raise ValueError(
+            "Replica CuTeDSL output gradients must match the staging dtype or convert "
+            "FP32 staging to BF16."
+        )
     pointer_type = BFloat16 if grad_dtype == torch.bfloat16 else Float32
     kernel = _ReplicaGradReduceKernel(
         grad_dtype=grad_dtype,
+        output_grad_dtype=output_grad_dtype,
         world_size=world_size,
         num_local_experts=num_local_experts,
         fc1_member_numel=fc1_member_numel,
@@ -1085,7 +1127,17 @@ def _get_compiled_grad_reduce(
     grad_ptr = make_ptr(pointer_type, 0, cute.AddressSpace.gmem, assumed_align=16)
     i32_ptr = make_ptr(Int32, 0, cute.AddressSpace.gmem, assumed_align=16)
     i64_ptr = make_ptr(Int64, 0, cute.AddressSpace.gmem, assumed_align=8)
-    pointer_args = (grad_ptr, i64_ptr, i64_ptr, i64_ptr, i64_ptr, i32_ptr, i32_ptr)
+    pointer_args = (
+        grad_ptr,
+        i64_ptr,
+        i64_ptr,
+        i64_ptr,
+        i64_ptr,
+        i64_ptr,
+        i64_ptr,
+        i32_ptr,
+        i32_ptr,
+    )
     stream = cuda.CUstream(0)
     with torch.cuda.device(device_index):
         return cute.compile(kernel, *pointer_args, Int32(0), stream)
@@ -1099,6 +1151,7 @@ def compile_replica_weight_kernels(
     num_sms: int,
     device_index: int,
     grad_dtype: torch.dtype = torch.float32,
+    output_grad_dtype: torch.dtype | None = None,
     rowwise_scale_numels: tuple[int, int] | None = None,
     columnwise_scale_numels: tuple[int, int] | None = None,
 ) -> None:
@@ -1111,6 +1164,7 @@ def compile_replica_weight_kernels(
         num_sms,
         device_index,
         grad_dtype,
+        output_grad_dtype,
     )
     if rowwise_scale_numels is None and columnwise_scale_numels is None:
         _get_compiled_bf16_weight_push(
@@ -1222,14 +1276,30 @@ def _runtime_ptr(dtype, tensor_or_address, *, assumed_align: int = 16):
 
 
 def _as_pointer_table(
-    tensor: torch.Tensor, num_local_experts: int, *, dtype: torch.dtype
+    tensor: torch.Tensor | tuple[torch.Tensor, ...], num_local_experts: int, *, dtype: torch.dtype
 ) -> torch.Tensor:
-    """Return a stable device table containing one data pointer per local expert.
+    """Return a device table containing one data pointer per local expert.
 
-    The public kernel helpers historically accepted one contiguous ``[expert, ...]``
-    tensor.  Replica bridges can now pass an ``int64`` pointer table instead, which
-    also represents TE's independently allocated ``weight0..weightN`` parameters.
+    Accept a contiguous ``[expert, ...]`` tensor, an existing ``int64`` pointer table, or
+    independently allocated per-expert tensors such as GTP symmetric RS inputs.
     """
+    if not isinstance(tensor, torch.Tensor):
+        tensors = tuple(tensor)
+        if len(tensors) != num_local_experts or any(
+            value.device.type != "cuda" or value.dtype != dtype or not value.is_contiguous()
+            for value in tensors
+        ):
+            raise ValueError(
+                "Replica CuTeDSL tensor lists must contain one contiguous CUDA tensor per "
+                f"local expert with dtype {dtype}."
+            )
+        device = tensors[0].device
+        if any(value.device != device or value.numel() != tensors[0].numel() for value in tensors):
+            raise ValueError("Replica CuTeDSL tensor lists must have matching shapes and devices.")
+        return torch.tensor(
+            [value.data_ptr() for value in tensors], dtype=torch.int64, device=device
+        )
+
     if tensor.dtype == torch.int64:
         if (
             tensor.device.type != "cuda"
@@ -1349,6 +1419,7 @@ def launch_replica_grad_reduce(
     *,
     arena: torch.Tensor,
     native_grads: tuple[torch.Tensor, torch.Tensor],
+    output_grads: tuple[torch.Tensor | tuple[torch.Tensor, ...], ...] | None = None,
     peer_bases: torch.Tensor,
     signal_bases: torch.Tensor,
     experts_to_copy: torch.Tensor,
@@ -1359,7 +1430,11 @@ def launch_replica_grad_reduce(
     member_numels: tuple[int, int],
     num_sms: int,
 ) -> None:
-    """Accumulate virtual gradients into native wgrad staging and clear used slots."""
+    """Accumulate virtual gradients and clear used replica slots.
+
+    By default, outputs overwrite ``native_grads``. A separate output may convert the combined
+    native-plus-replica gradient once, after all replica contributions have accumulated.
+    """
     device_index = arena.device.index
     if device_index is None:
         raise ValueError("Replica CuTeDSL grad arena must be a CUDA tensor.")
@@ -1372,6 +1447,20 @@ def launch_replica_grad_reduce(
             "Replica CuTeDSL grad arena must use torch.float32 or torch.bfloat16, "
             f"got {arena.dtype}."
         )
+    if output_grads is None:
+        output_grads = native_grads
+        output_dtype = arena.dtype
+    else:
+        output_dtypes = {
+            grad.dtype if isinstance(grad, torch.Tensor) else grad[0].dtype for grad in output_grads
+        }
+        if len(output_dtypes) != 1:
+            raise ValueError("Replica CuTeDSL FC1 and FC2 output gradients must share a dtype.")
+        output_dtype = output_dtypes.pop()
+        if arena.dtype != torch.float32 or output_dtype != torch.bfloat16:
+            raise ValueError(
+                "Separate replica gradient results require FP32 staging and BF16 output."
+            )
     compiled = _get_compiled_grad_reduce(
         world_size,
         num_local_experts,
@@ -1380,16 +1469,22 @@ def launch_replica_grad_reduce(
         num_sms,
         device_index,
         arena.dtype,
+        output_dtype,
     )
     stream = cuda.CUstream(torch.cuda.current_stream(arena.device).cuda_stream)
     native_grad_bases = tuple(
         _as_pointer_table(native_grad, num_local_experts, dtype=arena.dtype)
         for native_grad in native_grads
     )
+    output_grad_bases = tuple(
+        _as_pointer_table(grad, num_local_experts, dtype=output_dtype) for grad in output_grads
+    )
     compiled(
         _runtime_ptr(pointer_type, arena),
         _runtime_ptr(Int64, native_grad_bases[0], assumed_align=8),
         _runtime_ptr(Int64, native_grad_bases[1], assumed_align=8),
+        _runtime_ptr(Int64, output_grad_bases[0], assumed_align=8),
+        _runtime_ptr(Int64, output_grad_bases[1], assumed_align=8),
         _runtime_ptr(Int64, peer_bases, assumed_align=8),
         _runtime_ptr(Int64, signal_bases, assumed_align=8),
         _runtime_ptr(Int32, experts_to_copy),
