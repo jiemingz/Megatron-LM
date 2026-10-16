@@ -103,6 +103,29 @@ K = "tests/unit_tests/determinism/kernels/"
 C = "tests/unit_tests/determinism/correctness/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
+    KernelEntry(
+        name="wide_residual_shortcut_moe",
+        sources=(
+            'megatron/core/fusions/wide_residual_shortcut/api.py',
+            'megatron/core/fusions/wide_residual_shortcut/inverse_write.py',
+            'megatron/core/fusions/wide_residual_shortcut/residual_inverse.py',
+            'megatron/core/fusions/wide_residual_shortcut/fusion_runtime.py',
+            'megatron/core/fusions/wide_residual_shortcut/helpers.py',
+            'megatron/core/fusions/wide_residual_shortcut/gluon_helpers.py',
+            'megatron/core/fusions/wide_residual_shortcut/reconstruction_joint_gluon.py',
+            'megatron/core/fusions/wide_residual_shortcut/reconstruction_prepare_gluon.py',
+            'megatron/core/fusions/wide_residual_shortcut/reconstruction.py',
+            'megatron/core/fusions/wide_residual_shortcut/reconstruction_backward_streams.py',
+            'megatron/core/fusions/wide_residual_shortcut/reconstruction_cooperative_native.py',
+            'megatron/core/fusions/wide_residual_shortcut/reconstruction_cooperative_streams.py',
+            'megatron/core/fusions/wide_residual_shortcut/reconstruction_dispatch.py',
+            'megatron/core/fusions/wide_residual_shortcut/reconstruction_stream_reductions.py',
+            'megatron/core/fusions/wide_residual_shortcut/reconstruction_streams.py',
+        ),
+        tests=(K + "test_wide_residual_shortcut.py",),
+        kind="triton",
+        notes="Independent S=3 cooperative kernel; generalized standard/cooperative paths and call-local autograd.",
+    ),
     # ---------------------------------------------------------------- fused elementwise (jit_fuser / torch.compile)
     KernelEntry(
         name="fused_bias_swiglu",

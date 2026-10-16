@@ -1304,6 +1304,15 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # Wide Residual Configuration
     ####################
+    wide_residual_shortcut_moe_kernel_fusion: bool = False
+    """Fuse wide-residual Mamba/GDN shortcut-MoE write/read/RMSNorm seams.
+
+    Requires shortcut MoE, 2--6 wide streams, BF16 branches, ordinary RMSNorm,
+    bias-free/dropout-free eager training, FP32 residuals, and a shared expert.
+    Local flattened tokens must be a positive multiple of 1024; hidden size must
+    be divisible by 32 and <=10240.
+    """
+
     wide_residual: Optional[WideResidualConfig] = None
     """Optional streamwise wide-residual architecture configuration.
 
@@ -1312,9 +1321,13 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     residual_stream_recompute_num_layers: Optional[int] = None
-    """Number of local layers per ordered residual-stream replay block.
+    """Number of local layers between residual-stream checkpoints.
 
-    ``None`` places all local layers in one block. This setting requires selective
+    With shortcut kernel fusion, ``None`` or 1 keeps each layer's residual;
+    larger values share reconstructed residuals backward without forward replay
+    or another recompute flag.
+    Complete shortcut pairs stay in the same block. Without fusion, ``None``
+    places all local layers in one block and this setting requires selective
     recomputation with ``"residual_stream"`` in ``recompute_modules``.
     """
 
@@ -1641,6 +1654,13 @@ class TransformerConfig(ModelParallelConfig):
         # downstream reads a plain bool.
         if self.moe_router_aux_loss_fusion is None:
             self.moe_router_aux_loss_fusion = self.moe_router_fusion
+
+        if self.wide_residual_shortcut_moe_kernel_fusion:
+            from megatron.core.models.hybrid.layers.shortcut_fusion_validation import (
+                validate_shortcut_fusion_config,
+            )
+
+            validate_shortcut_fusion_config(self)
 
         if self.wide_residual is not None:
             if self.enable_mhc_connections:
@@ -2487,7 +2507,10 @@ class TransformerConfig(ModelParallelConfig):
                 "'residual_stream' in recompute_modules requires "
                 "recompute_granularity='selective'."
             )
-        if use_residual_stream_recompute:
+        if use_residual_stream_recompute or (
+            self.wide_residual_shortcut_moe_kernel_fusion
+            and self.residual_stream_recompute_num_layers is not None
+        ):
             if self.wide_residual is None:
                 raise ValueError(
                     "'residual_stream' recomputation requires a configured wide residual stream."

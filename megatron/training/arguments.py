@@ -147,7 +147,10 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
 
     # Experimental yaml
     if args.yaml_cfg is not None:
-        if _wide_residual_config_from_args(args) is not None:
+        if (
+            _wide_residual_config_from_args(args) is not None
+            or args.wide_residual_shortcut_moe_kernel_fusion
+        ):
             raise ValueError(
                 'Wide-residual CLI arguments cannot be combined with --yaml-cfg because '
                 'YAML model configuration replaces argparse model arguments.'
@@ -155,7 +158,6 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
         from .yaml_arguments import load_yaml
 
         args = load_yaml(args.yaml_cfg)
-
 
     # Args from environment
     args.rank = int(os.getenv('RANK', '0'))
@@ -2474,6 +2476,7 @@ def _add_network_size_args(parser):
         "expert_gtp_weight_remat_size",
         # Constructed from the dedicated flat CLI arguments below.
         "wide_residual",
+        "wide_residual_shortcut_moe_kernel_fusion",
         "max_seqlen_per_dp_cp_rank",
         "hybrid_context_parallel",
         "sequence_packing_scheduler",
@@ -2574,6 +2577,13 @@ def _add_wide_residual_args(parser):
     """Add CLI arguments used to construct ``WideResidualConfig``."""
 
     group = parser.add_argument_group(title='wide residual')
+    group.add_argument(
+        '--wide-residual-shortcut-moe-kernel-fusion',
+        action='store_true',
+        help='Fuse supported wide-residual shortcut-MoE boundaries. Requires H divisible by '
+        '32, local T divisible by 1024, and 2--6 streams. Requires '
+        '--fp32-residual-connection with BF16 branches.',
+    )
     group.add_argument(
         '--wide-residual',
         dest='wide_residual_num_streams',

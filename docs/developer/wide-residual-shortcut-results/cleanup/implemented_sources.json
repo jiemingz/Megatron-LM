@@ -1,0 +1,16 @@
+{
+  "Megatron-LM/megatron/core/fusions/wide_residual_shortcut/__init__.py": "b08ff5caebae5b85c1a1c754f197c12bd004e040552f9e6b9f263a28c3767159",
+  "Megatron-LM/megatron/core/fusions/wide_residual_shortcut/api.py": "39e84feb4f13b4ecf38d553b2c6efd4befe8b81a3d2d93f20267d569a6aac4a4",
+  "Megatron-LM/megatron/core/fusions/wide_residual_shortcut/fusion_runtime.py": "a8425f33b516936029ae8fd8bfe0c625b83fbf2d2f5dc6c2028d9688694047e2",
+  "Megatron-LM/megatron/core/fusions/wide_residual_shortcut/gluon_helpers.py": "bb25256c007889b2655a0672570b630a19f87445e8ec1c162e67d197b8562240",
+  "Megatron-LM/megatron/core/fusions/wide_residual_shortcut/helpers.py": "3bf06e27fdb60c6aa9c154b70142e2b5f6495e59cce19659be36b0f7e2cecce5",
+  "Megatron-LM/megatron/core/fusions/wide_residual_shortcut/reconstruction.py": "2a4d6deb5de27faad67133e252522d6d413a9da3a58a3517a464dd9e28b5b7a1",
+  "Megatron-LM/megatron/core/fusions/wide_residual_shortcut/reconstruction_backward_streams.py": "13d5690cbc2217ebf0eb5a72c9cdc71c8677c548c50a5b180acb33d4c14fb286",
+  "Megatron-LM/megatron/core/fusions/wide_residual_shortcut/reconstruction_cooperative_native.py": "842b6adc0daecc6aef9bf58d9d9cc8c3569e1188956a467fb64e8fb526fef1cc",
+  "Megatron-LM/megatron/core/fusions/wide_residual_shortcut/reconstruction_cooperative_streams.py": "4a262bdb94fa4bcb1ca23bcc1a971c3940a6f4f59417319f03fd56fd18e5323a",
+  "Megatron-LM/megatron/core/fusions/wide_residual_shortcut/reconstruction_dispatch.py": "aeeb2c5e4a5b588adb203fdbc296965f510dc011299b6e329a5964c260e7ca4e",
+  "Megatron-LM/megatron/core/fusions/wide_residual_shortcut/reconstruction_joint_gluon.py": "ad7c4b979074632fa2b2ebd096c855af05fbf5bb40003bdb4919d7da3ef68068",
+  "Megatron-LM/megatron/core/fusions/wide_residual_shortcut/reconstruction_prepare_gluon.py": "4ffff11b6c3c6a83aef8cd77e483656025fea728e47b62567749f68471e48b0c",
+  "Megatron-LM/megatron/core/fusions/wide_residual_shortcut/reconstruction_stream_reductions.py": "f05b834cceb48997278f7631be880927037407b3b2020ce3ab85fb57cdd41140",
+  "Megatron-LM/megatron/core/fusions/wide_residual_shortcut/reconstruction_streams.py": "ba74d59879ded235ee84ff5831ec3df9f028aa453476ec18e0d89260445b612b"
+}

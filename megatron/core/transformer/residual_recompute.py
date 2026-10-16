@@ -55,8 +55,11 @@ class ResidualStreamRecomputeContext:
 
 
 def residual_stream_recompute_enabled(config: TransformerConfig, training: bool) -> bool:
-    """Return whether selective residual-stream replay is active for this forward."""
+    """Return whether ordered residual-stream replay is active for this forward."""
 
+    if config.wide_residual_shortcut_moe_kernel_fusion:
+        # Fused stacks share inverse outputs directly; never wrap them in forward replay.
+        return False
     return bool(
         training
         and torch.is_grad_enabled()

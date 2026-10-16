@@ -1,0 +1,72 @@
+{
+  "complete": true,
+  "performance": [
+    {
+      "mode": "learned",
+      "run": 1,
+      "worst_regression_pct": 1.2318537324814693,
+      "worst_case": {
+        "m": 8192,
+        "h": 4096,
+        "readers": 2,
+        "format": "bf16",
+        "phase": "backward"
+      }
+    },
+    {
+      "mode": "learned",
+      "run": 2,
+      "worst_regression_pct": 1.240250236277296,
+      "worst_case": {
+        "m": 8192,
+        "h": 4096,
+        "readers": 2,
+        "format": "bf16",
+        "phase": "backward"
+      }
+    },
+    {
+      "mode": "disabled",
+      "run": 1,
+      "worst_regression_pct": 0.2825676371048358,
+      "worst_case": {
+        "m": 8192,
+        "h": 4096,
+        "readers": 1,
+        "format": "mxfp8",
+        "phase": "forward"
+      }
+    },
+    {
+      "mode": "disabled",
+      "run": 2,
+      "worst_regression_pct": 0.29790125605066997,
+      "worst_case": {
+        "m": 8192,
+        "h": 4096,
+        "readers": 1,
+        "format": "mxfp8",
+        "phase": "forward"
+      }
+    }
+  ],
+  "performance_limit_pct": 2,
+  "all_performance_comparisons_passed": true,
+  "bitwise_before_after_outputs_and_gradients": true,
+  "megatron_tests_passed": 115,
+  "numerical_cases": {
+    "small": 48,
+    "production": 12,
+    "adversarial": 168,
+    "checkpoint16_chains": 36
+  },
+  "sanitizers": [
+    "memcheck",
+    "racecheck",
+    "synccheck"
+  ],
+  "native_specializations_audited": 12,
+  "native_resources_preserved": true,
+  "canonical_source": "Megatron-LM/megatron/core/fusions/wide_residual_shortcut",
+  "standalone_module_aliases": 10
+}

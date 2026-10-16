@@ -26,6 +26,11 @@ import math
 import torch
 from torch import Tensor
 
+from megatron.core.fusions.wide_residual_shortcut.residual_inverse import (
+    current_manager,
+    register_write,
+    watch_residual,
+)
 from megatron.core.inference.utils import InferenceMode
 
 try:
@@ -74,7 +79,8 @@ def _streamwise_block_config(batch: int, stream_width: int) -> tuple[int, int, i
     if stream_width >= 512:
         return 32, 256, 4
     block_batch = 64 if batch >= 4096 else 32
-    return block_batch, min(128, stream_width), 4
+    # Triton arange extents must be powers of two, including widths such as 96.
+    return block_batch, min(128, 1 << (stream_width - 1).bit_length()), 4
 
 
 def _num_gradient_partials(batch: int, stream_width: int) -> int:
@@ -742,6 +748,7 @@ class _StreamwiseSigmoidRead(torch.autograd.Function):
         """Run the fused streamwise read and save tensors for backward."""
 
         ctx.save_for_backward(hidden_states, read_logits)
+        ctx.inverse_slot = watch_residual(hidden_states)
         ctx.num_streams = num_streams
         return _streamwise_sigmoid_read_triton(
             hidden_states, read_logits, num_streams, output_dtype
@@ -752,6 +759,9 @@ class _StreamwiseSigmoidRead(torch.autograd.Function):
         """Compute activation and read-controller gradients."""
 
         hidden_states, read_logits = ctx.saved_tensors
+        if ctx.inverse_slot is not None:
+            ctx.inverse_slot.ensure()
+            ctx.inverse_slot = None
         grad_hidden, grad_logits = _streamwise_sigmoid_read_backward_triton(
             hidden_states, grad_output.contiguous(), read_logits, ctx.num_streams
         )
@@ -780,7 +790,7 @@ class _StreamwiseSigmoidWriteback(torch.autograd.Function):
             ctx.save_for_backward(branch_update, write_logits)
         else:
             ctx.save_for_backward(residual_stream, branch_update, write_logits, retention_logits)
-        return _streamwise_sigmoid_write_triton(
+        output = _streamwise_sigmoid_write_triton(
             residual_stream,
             branch_update,
             write_logits,
@@ -788,6 +798,12 @@ class _StreamwiseSigmoidWriteback(torch.autograd.Function):
             retention_logits,
             retention_max_forget,
         )
+
+        ctx.inverse_link = register_write(
+            residual_stream, output, branch_update, write_logits, retention_logits,
+            num_streams, retention_max_forget,
+        )
+        return output
 
     @staticmethod
     def backward(ctx, grad_output: Tensor) -> tuple[Tensor | None, ...]:  # type: ignore[override]
@@ -799,6 +815,19 @@ class _StreamwiseSigmoidWriteback(torch.autograd.Function):
             branch_update, write_logits = ctx.saved_tensors
             residual_stream = None
             retention_logits = None
+        if ctx.inverse_link is not None:
+            from megatron.core.fusions.wide_residual_shortcut.inverse_write import inverse_write
+
+            link = ctx.inverse_link
+            link.require_current()
+            if link.needs_previous():
+                previous = inverse_write(
+                    link.current, branch_update, write_logits, retention_logits,
+                    ctx.num_streams, ctx.retention_max_forget,
+                )
+                link.restore(previous)
+            link.release()
+            ctx.inverse_link = None
         gradients = _streamwise_sigmoid_write_backward_triton(
             residual_stream,
             branch_update,
@@ -918,8 +947,22 @@ def streamwise_sigmoid_writeback(
         and branch_update.is_contiguous()
         and branch_update.dtype in _STREAMWISE_TRITON_DTYPES
     )
+    inverse_owner = current_manager()
+    if inverse_owner is not None:
+        _, block_width, _ = _streamwise_block_config(
+            math.prod(residual_stream.shape[:-1]), stream_width
+        )
+        if (
+            not supports_triton
+            or not update_supports_triton
+            or block_width & (block_width - 1)
+        ):
+            raise ValueError(
+                "residual inverse handoff requires a qualified native streamwise writer; "
+                "use residual_stream_recompute_num_layers=1 for this shape"
+            )
     if supports_triton and update_supports_triton:
-        if needs_backward:
+        if needs_backward or current_manager() is not None:
             return _StreamwiseSigmoidWriteback.apply(
                 residual_stream,
                 branch_update,

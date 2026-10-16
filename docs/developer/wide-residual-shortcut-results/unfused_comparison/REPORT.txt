@@ -1,0 +1,25 @@
+Retention-disabled fused vs unfused kernel timings, GB300 GPU0
+
+Both paths use true retention=None (effective multiplier one). No learned-retention baseline is used.
+Baseline: current Megatron streamwise sigmoid write/read kernels + standalone shortcut_rmsnorm + TE MXFP8 quantization when requested.
+S=3; Nano M16384 H3072, Super M8192 H4096, Ultra M8192 H10240.
+FP32 residuals and reader intermediates; BF16 updates, incoming reader gradients and gamma. BF16 or MXFP8 consumer operands.
+Unfused saves X/Y and aliases the incoming write gradient; fused reconstructs the previous residual and regenerates column operands. Those native differences are preserved.
+Complete forward/backward boundary calls including resets, gradient accumulation and final reductions; no GEMMs or optimizer. CUDA graph replay excludes Python/autograd and allocator CPU overhead.
+Two independent serial processes on GPU0 under /tmp/nano_cooperative_gpu0.lock. Three pools, 60 calls/graph, five replays/sample, nine randomized rounds/process. Aggregate latency is median of all 18 samples.
+No profiler was active. These are boundary kernel speedups, not end-to-end model speedups.
+Forward residual equality checked at rtol=atol=2e-6; gradient relative L2 max=0.0017244706396013498. Quantized operands are generated in both paths; bitwise equality between independently evaluated unfused/fused arithmetic is not asserted.
+
+model format fusion | forward unfused -> fused us (speedup) | backward unfused -> fused us (speedup)
+nano bf16 A | 420.06 -> 268.89 (1.562x) | 794.25 -> 521.08 (1.524x)
+nano bf16 B | 690.46 -> 370.53 (1.863x) | 1378.64 -> 499.75 (2.759x)
+nano mxfp8 A | 415.61 -> 266.44 (1.560x) | 830.14 -> 528.83 (1.570x)
+nano mxfp8 B | 678.07 -> 365.28 (1.856x) | 1452.51 -> 486.10 (2.988x)
+super bf16 A | 282.30 -> 180.56 (1.563x) | 521.08 -> 352.34 (1.479x)
+super bf16 B | 463.74 -> 251.10 (1.847x) | 899.68 -> 336.75 (2.672x)
+super mxfp8 A | 278.97 -> 176.94 (1.577x) | 545.90 -> 357.59 (1.527x)
+super mxfp8 B | 456.65 -> 246.39 (1.853x) | 951.32 -> 330.41 (2.879x)
+ultra bf16 A | 689.98 -> 443.99 (1.554x) | 1306.18 -> 854.18 (1.529x)
+ultra bf16 B | 1134.66 -> 613.09 (1.851x) | 2272.35 -> 859.77 (2.643x)
+ultra mxfp8 A | 681.80 -> 444.66 (1.533x) | 1364.00 -> 864.21 (1.578x)
+ultra mxfp8 B | 1113.39 -> 614.51 (1.812x) | 2388.31 -> 848.87 (2.814x)

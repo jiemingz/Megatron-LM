@@ -1,0 +1,147 @@
+{
+  "source_qualification": "streams_20261014",
+  "schema": "recursive AST fields, excluding type_params and source locations",
+  "frozen_three_stream_device_functions": {
+    "reconstruction.py": {
+      "_inverse_value": "35398f986a01a44ca9db3ff939d6287eb230e56895f049c8a8775354b3093aa9",
+      "_coeff": "a1fa5eec27b623fdbf77c89746addaa985f85499e133c052131626857fe620b4",
+      "_values": "4fb06e4520d0b235c6faac3533d6fe282a622cabf8b0dc603c42295f83d29db2",
+      "_mix": "c75d07340aa9789012c8abdb1fb3cd89a15e5f10d31e041cffa27b7706330445",
+      "_encode": "4f928a77681e22019dbf005e27b182ae332edd3d7275b5e0d1c323b7af7fdb89",
+      "_norm_row": "80da75755c83bed199473e0b12beca7bd64bd3851bbdd35c01490ddcbe7532fa",
+      "_norm_row_bf16": "6b0ffd33f0a5344fe0b61c8763c3f7100b67ac04d3a78c1fab7c53eaf6011d8c"
+    },
+    "reconstruction_cooperative_native.py": {
+      "_group_publish_counter_pointer": "f8537531bed7f6eeff3e510b16a1d6aa0912bbdf16c01d81ba39e7a0192e5a6e",
+      "_group_wait_counter_pointer": "eefe432ab3ba2928bd44badf67738c5780dd594b1d26f9e3afb3dbe3864d15e4",
+      "_controller_warps": "37db67c40acbbce57d11c74e6abae699987737e3ef020d478dec6db7445a067d",
+      "_markstein_uniform_divide": "2f148b7788176bfc2f39cd01b0ce98b1ff2ff68a2432a8eb7462c60a7314ddc5",
+      "_matched_inverse": "f38f808c78008dd718dd9a9f8e5616f8de62220daba71fe60f16a36270e65bb2",
+      "_shared_part": "6167ac22626bd14b87668fb50ed90ecb0098fe9978d3197228d846057351a740",
+      "_coefficient": "4100d7ff5c308e8d80c979a8bfcb1af11abc645a57eafbae6960383293aa3c10",
+      "_fma2": "5593b5d023eb88b8c506fc4a0ee649ec849bdacd424e4ce19930fe79fa467577",
+      "_k3_part": "4ac058a3441c3cc669e84423222bd2948010e85cf91837ebfa8005a7665010ff",
+      "_partial_offset": "c78c2da8c0b460ca738a332019d90825144e5643a59dd7c24f2a503a7abd733d",
+      "_quant_pair_axis": "b0ddf3cff26111209ef94fec8b3b722809e93a904d6fb49b675168d687828164",
+      "_reader_axis": "9c9ed70cecb87bc74c2f3b65cd2a3acd08c63da66530f1c566399a59d7d52577",
+      "_prefetch_u_only": "4bc4000091d3de22feee5250edec5b80e8f3b0212caf60c042d6573f439f414f",
+      "_prefetch_carry_only": "6478a408f94158bbf722c8823bd8d0e65573247a736715743a7fbe69eceead43",
+      "_cooperative": "0e53936037ea72b0269a5d3ad5686a7a224206dd823a928d6c1c4d74eb6a8cf3",
+      "_gamma_controller_finish": "9abd413eaec24a39e323df220827c978a7a62fc398daf6f7bd4fac8a322c6651"
+    },
+    "helpers.py": {
+      "_native_updated": "a829d34ca77128771e27d89a2ba797e587166c052efe543de9f792f386c97349",
+      "_finish_projection": "500a11ac2b4340080875690f6653329eb49e711f709afa70ebe71f4225fa1b09",
+      "_controller_chunks": "48e8b86f70b4e6062f298e349be74dd9883976504ad3df839daf1b5a51cf97d6",
+      "_finish_controllers": "d4794dd13a0f01e19bee1d188d34fd81b4ff618ee5bb292cce4a8d748376e650",
+      "_weight_finish": "156c16559446671c8942dcb635efe5b200da146d03e961f1422156240711cab5"
+    }
+  },
+  "retention_disabled_device_functions": {
+    "reconstruction.py": {
+      "_inverse_value": "e37aac878f78d92274624d66e5f17eb12e9fbe0ef7241d8cf52689467a9996c8",
+      "_coeff": "073275f1a7b930ff0c5b0495787fb29b9521ba0e31d1acf9e3cf93ac885e9d4f",
+      "_values": "5108d78e91737ccf28906718171bb6ba2b819deb3c1e1757f040b2042c347637",
+      "_mix": "ea0230b9b9440dc7075a47f8c5ae2cd279711cae7b4b81b8169b6bb5b45434f4",
+      "_encode": "4f928a77681e22019dbf005e27b182ae332edd3d7275b5e0d1c323b7af7fdb89",
+      "_norm_row": "80da75755c83bed199473e0b12beca7bd64bd3851bbdd35c01490ddcbe7532fa",
+      "_norm_row_bf16": "6b0ffd33f0a5344fe0b61c8763c3f7100b67ac04d3a78c1fab7c53eaf6011d8c"
+    },
+    "reconstruction_cooperative_native.py": {
+      "_group_publish_counter_pointer": "f8537531bed7f6eeff3e510b16a1d6aa0912bbdf16c01d81ba39e7a0192e5a6e",
+      "_group_wait_counter_pointer": "eefe432ab3ba2928bd44badf67738c5780dd594b1d26f9e3afb3dbe3864d15e4",
+      "_controller_warps": "37db67c40acbbce57d11c74e6abae699987737e3ef020d478dec6db7445a067d",
+      "_markstein_uniform_divide": "2f148b7788176bfc2f39cd01b0ce98b1ff2ff68a2432a8eb7462c60a7314ddc5",
+      "_matched_inverse": "429032df12e8bc533742059c8712e0f0ada628da7b9d9c4eea5e8a9d200c40c7",
+      "_shared_part": "6167ac22626bd14b87668fb50ed90ecb0098fe9978d3197228d846057351a740",
+      "_coefficient": "4100d7ff5c308e8d80c979a8bfcb1af11abc645a57eafbae6960383293aa3c10",
+      "_fma2": "5593b5d023eb88b8c506fc4a0ee649ec849bdacd424e4ce19930fe79fa467577",
+      "_k3_part": "b2218df7b6390c7fa6a6ccdd2f503e2bedd0c3ee8c9cb6845648332694fcfca9",
+      "_partial_offset": "c78c2da8c0b460ca738a332019d90825144e5643a59dd7c24f2a503a7abd733d",
+      "_quant_pair_axis": "b0ddf3cff26111209ef94fec8b3b722809e93a904d6fb49b675168d687828164",
+      "_reader_axis": "9c9ed70cecb87bc74c2f3b65cd2a3acd08c63da66530f1c566399a59d7d52577",
+      "_prefetch_u_only": "4bc4000091d3de22feee5250edec5b80e8f3b0212caf60c042d6573f439f414f",
+      "_prefetch_carry_only": "6478a408f94158bbf722c8823bd8d0e65573247a736715743a7fbe69eceead43",
+      "_cooperative": "c3848b5afe8f01afcf5a88d9847881d618b82ffd1e64495e204eece25ac5ebde",
+      "_gamma_controller_finish": "3ceb746c43064c4bb85573a4098e5be3d6c2dac2e838ff1d768c56c80b0514d5"
+    },
+    "helpers.py": {
+      "_native_updated": "a829d34ca77128771e27d89a2ba797e587166c052efe543de9f792f386c97349",
+      "_finish_projection": "500a11ac2b4340080875690f6653329eb49e711f709afa70ebe71f4225fa1b09",
+      "_controller_chunks": "48e8b86f70b4e6062f298e349be74dd9883976504ad3df839daf1b5a51cf97d6",
+      "_finish_controllers": "d4794dd13a0f01e19bee1d188d34fd81b4ff618ee5bb292cce4a8d748376e650",
+      "_weight_finish": "156c16559446671c8942dcb635efe5b200da146d03e961f1422156240711cab5"
+    }
+  },
+  "retention_disabled_note": "Static HAS_RETENTION branches extend the frozen kernels. Historical hashes above are preserved; correctness, replay, and learned-mode regression evidence are tracked separately in results/retention_disabled_20261015.",
+  "shared_device_functions": {
+    "gluon_helpers.py": {
+      "_inverse_value": "04d950ac0d4a2509b6aee4b99d6399e41fe4699aab04dd2b4241f7d2434fb393",
+      "_rmsnorm_dx": "82d1626bc468b77f338afe59f15a520b2525ff3206b4ed68180646b6cb8771d1",
+      "_reader_gradient": "80867e4a09ec61245cede50414f601f07eafe915824a818767a06d65a1c125a5"
+    },
+    "helpers.py": {
+      "_native_updated": "a829d34ca77128771e27d89a2ba797e587166c052efe543de9f792f386c97349",
+      "_finish_projection": "500a11ac2b4340080875690f6653329eb49e711f709afa70ebe71f4225fa1b09",
+      "_weight_finish": "156c16559446671c8942dcb635efe5b200da146d03e961f1422156240711cab5",
+      "_inverse_value": "e37aac878f78d92274624d66e5f17eb12e9fbe0ef7241d8cf52689467a9996c8",
+      "_reader_gradient": "77deedcb2a3add9154ebf5cbbf8c07f59f4b62d5d9119b693af1adb04d944611"
+    },
+    "reconstruction.py": {
+      "_coeff": "ed27249d5e1fdd31b982aed70a2b26efc77c514a8964be9f93a0a6ed1681ef89",
+      "_values": "42307bbba0670c896f981a6141f28cd9c5da3147eb513ab48a70eb987a400af8",
+      "_mix": "18718c42d2eedd649ddf0ddf3f720808a7ac8f16dddc9b7fdb4926b6a0e00fe7",
+      "_encode": "4f928a77681e22019dbf005e27b182ae332edd3d7275b5e0d1c323b7af7fdb89",
+      "_norm_row": "80da75755c83bed199473e0b12beca7bd64bd3851bbdd35c01490ddcbe7532fa",
+      "_norm_row_bf16": "6b0ffd33f0a5344fe0b61c8763c3f7100b67ac04d3a78c1fab7c53eaf6011d8c"
+    },
+    "reconstruction_backward_streams.py": {
+      "_prepare_one": "cf6e950c8161ea7c0679e554e095f826e32735e5b88bb24830d2af0208fd9381",
+      "_prepare": "3efa1b5b819979dcadb56168bb8581fd976410ace4a466480cd04ab980d225eb",
+      "_finish_reads": "f4adc9a1e1d0284afa4a112914fbe81125ff014cd316e18ef0e9844a63c4d51f",
+      "_joint": "04ef101c9cd3142f5e9fe7ecd8c1346cb54d4fb6b52c77ee9e68c90c3c619dee"
+    },
+    "reconstruction_cooperative_native.py": {
+      "_group_publish_counter_pointer": "f8537531bed7f6eeff3e510b16a1d6aa0912bbdf16c01d81ba39e7a0192e5a6e",
+      "_group_wait_counter_pointer": "eefe432ab3ba2928bd44badf67738c5780dd594b1d26f9e3afb3dbe3864d15e4",
+      "_controller_warps": "37db67c40acbbce57d11c74e6abae699987737e3ef020d478dec6db7445a067d",
+      "_markstein_uniform_divide": "2f148b7788176bfc2f39cd01b0ce98b1ff2ff68a2432a8eb7462c60a7314ddc5",
+      "_matched_inverse": "429032df12e8bc533742059c8712e0f0ada628da7b9d9c4eea5e8a9d200c40c7",
+      "_shared_part": "6167ac22626bd14b87668fb50ed90ecb0098fe9978d3197228d846057351a740",
+      "_coefficient": "4100d7ff5c308e8d80c979a8bfcb1af11abc645a57eafbae6960383293aa3c10",
+      "_fma2": "5593b5d023eb88b8c506fc4a0ee649ec849bdacd424e4ce19930fe79fa467577",
+      "_k3_part": "7a39f689aceaba259d7350b903503c7d08329a567b3d1b34e9f33bb705268f19",
+      "_partial_offset": "c78c2da8c0b460ca738a332019d90825144e5643a59dd7c24f2a503a7abd733d",
+      "_quant_pair_axis": "b0ddf3cff26111209ef94fec8b3b722809e93a904d6fb49b675168d687828164",
+      "_reader_axis": "9c9ed70cecb87bc74c2f3b65cd2a3acd08c63da66530f1c566399a59d7d52577",
+      "_prefetch_u_only": "4bc4000091d3de22feee5250edec5b80e8f3b0212caf60c042d6573f439f414f",
+      "_prefetch_carry_only": "6478a408f94158bbf722c8823bd8d0e65573247a736715743a7fbe69eceead43",
+      "_cooperative": "c3848b5afe8f01afcf5a88d9847881d618b82ffd1e64495e204eece25ac5ebde",
+      "_gamma_controller_finish": "3ceb746c43064c4bb85573a4098e5be3d6c2dac2e838ff1d768c56c80b0514d5"
+    },
+    "reconstruction_cooperative_streams.py": {
+      "_k3_part": "b485c0551a0733598134ab7032dcae2ffd52bdafad63765e7558944dd5a1300d",
+      "_reader_axis": "bcb3abd4de57169ae661c3eea126d56059a605dd50704c5d2d624869b7bae4f5",
+      "_prefetch_carry_only": "14366c9403c604b6e482aa7c857e0c80ed8d2406c50f2fa3e3ec3d079ac55b13",
+      "_cooperative": "1372ea22ea1c705b4a3d3f737804f0bc9c24a97d916aa589e5fa9a47d564c1b2",
+      "_gamma_controller_finish": "c1057e3020a74dbc808412323a589e8d88ea202cf07e49818a3ada2a91b990d1"
+    },
+    "reconstruction_joint_gluon.py": {
+      "_joint_gluon": "04fb19c91e253eb2b479d86e387b8e0fa33a52872e4787211d944700313b9fac"
+    },
+    "reconstruction_prepare_gluon.py": {
+      "_reader": "43b00563fd2ef3232502594669620e1c5cc3ad927cffff67dcffd36a5c9b3643",
+      "_prepare_gluon": "85c9a4c6a1b7128cec10310be249b2ae50a877aa92efea9cfe00ded3349fbd5f"
+    },
+    "reconstruction_stream_reductions.py": {
+      "_controller_chunks": "2f0f2e339064eec418a3eaec22d15c88304608f299f640395d03a223cb37dfa6",
+      "_finish_controllers": "9bf21023fc9a71dcfa545c6987a3d0761bac2e9cff3a3faab16f1df195a85ee6"
+    },
+    "reconstruction_streams.py": {
+      "_coeff": "791152ba36895559603c233aafa139bab8d9a1845d5dbbd446f4c90c5490af35",
+      "_values": "8e6f86405b46dec06cadebe731e7ea670c4dd7c77b05f77e6f602d23c2e6a147",
+      "_mix": "d61a51ce3e8396648e2f4afa0a5d4bf3c10b80a20af9a3de8349b83f65d31401"
+    }
+  },
+  "shared_source_note": "Megatron package is canonical. Standalone production entry points alias these modules via _production_kernels.py. Shared TL/Gluon helpers inline into the existing launch geometry; prior source manifests remain historical. Evidence: shortcut_block_bench/results/kernel_cleanup_20261015."
+}

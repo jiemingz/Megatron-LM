@@ -1,0 +1,27 @@
+Kernel cleanup and canonical Megatron source, 2026-10-15
+
+COMPLETED. Production implementation is owned by Megatron-LM/megatron/core/fusions/wide_residual_shortcut/.
+Ten standalone modules now alias the canonical module objects, including private JIT helpers and the shared diagnostic registry. This replaces 5,191 lines with 50 lines of shims plus the shared loader; future edits need no copy/sync step.
+
+Shared device code:
+- reconstruction_streams.py owns coefficient, residual write and reconstruction arithmetic for A/B and S1..6. Existing S3 JIT entry points inline those functions with NUM_STREAMS=3.
+- helpers.py owns the TL matched inverse and per-reader gradient. gluon_helpers.py owns the Gluon inverse, per-reader gradient, and RMSNorm derivative shared with cooperative B.
+- TL and Gluon functions remain separate because tensor/layout types differ. No GPU launch, tile, grid, register cap, shared lifetime or synchronization protocol was added or changed.
+- Removed unused fixed-three-stream controller reduction copies and unreachable row-reduction allocation/validation geometry from production code.
+- Historical standalone experiments remain benchmark controls and are not imported by Megatron. Do not run archived sync_package.py scripts against the new shims.
+
+Validation:
+115 Megatron fusion/determinism tests passed, including module-identity checks for all ten shims.
+48 small S1..6 cases, 12 production A/B BF16/MXFP8 cases, 168 adversarial cases and 36 checkpoint16 chains passed. Checks include exact TE operands/scales, gradients, matched inverse, graph replay and workspace reuse.
+Unfiltered memcheck, racecheck and synccheck passed on complete A/B calls and graph replay.
+Native B assembly: 12 specializations checked across models, formats and retention modes. Instruction counts, registers (168), shared bytes (75,640), residency and zero spills are preserved. Some instruction ordering/register assignments differ; no blanket byte-identical assembly claim is made.
+
+Performance vs pre-cleanup snapshot:
+Four independent serial processes on locked GPU0: two learned and two disabled-retention runs. Each uses three pools, 60 calls/graph, five replays, nine randomized paired rounds against before/packaged/. All 96 comparisons pass the strict <2% regression gate. Forward residuals and backward gradients compare bitwise equal to the frozen pre-cleanup control.
+learned run 1: worst regression 1.2319% ({'m': 8192, 'h': 4096, 'readers': 2, 'format': 'bf16', 'phase': 'backward'})
+learned run 2: worst regression 1.2403% ({'m': 8192, 'h': 4096, 'readers': 2, 'format': 'bf16', 'phase': 'backward'})
+disabled run 1: worst regression 0.2826% ({'m': 8192, 'h': 4096, 'readers': 1, 'format': 'mxfp8', 'phase': 'forward'})
+disabled run 2: worst regression 0.2979% ({'m': 8192, 'h': 4096, 'readers': 1, 'format': 'mxfp8', 'phase': 'forward'})
+
+Raw samples: learned_1/2.json and disabled_1/2.json. Full source snapshots: before/. Native assembly: assembly/. Current implementation hashes: implemented_sources.json.
+This is cleanup qualification, not a new DRAM-utilization qualification; the previously unmet disabled B >80% target is not claimed as resolved.

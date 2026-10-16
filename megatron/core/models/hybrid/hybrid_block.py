@@ -20,6 +20,7 @@ from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.fusions.wide_residual_shortcut.residual_inverse import residual_inverse_scope
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
@@ -143,6 +144,10 @@ class HybridStack(MegatronModule):
         Args:
             name (str | None): module instance name passed top-down from its paranet module
         """
+        if config.wide_residual_shortcut_moe_kernel_fusion and not is_mtp_layer:
+            from megatron.core.models.hybrid.layers.shortcut_fusion import resolve_fusion_submodules
+
+            submodules = resolve_fusion_submodules(submodules)
         if (layer_type_list is None) == (layer_config_list is None):
             raise ValueError("Exactly one of layer_type_list or layer_config_list must be provided")
         if layer_type_list is not None:
@@ -687,7 +692,9 @@ class HybridStack(MegatronModule):
             else [None] * self.num_layers_per_pipeline_rank
         )
 
-        with outer_fp8_context:
+        with outer_fp8_context, residual_inverse_scope(
+            self.config, self.training and self.uses_wide_residual_stream
+        ) as inverse_manager:
             if self.config.recompute_granularity == 'full' and self.training:
                 hidden_states = checkpointed_forward(
                     self,
@@ -713,6 +720,9 @@ class HybridStack(MegatronModule):
                         strict=True,
                     )
                 ):
+                    physical_layers = 2 if isinstance(layer, ShortcutMoEBlock) else 1
+                    if inverse_manager is not None:
+                        inverse_manager.begin_layer(physical_layers)
                     layer_packed_seq_params = packed_seq_params
                     residual_stream_recompute_context = residual_stream_recompute_plan[
                         physical_layer_idx
@@ -733,6 +743,13 @@ class HybridStack(MegatronModule):
                                 "A registered ShortcutMoEBlock is missing its MoE physical index."
                             )
                         moe_recompute_context = residual_stream_recompute_plan[layer.moe_local_idx]
+                        fusion_kwargs = {}
+                        if getattr(layer, "fuses_shortcut_boundaries", False):
+                            fusion_kwargs["next_shortcut_block"] = (
+                                self.layers[layer_idx + 1]
+                                if layer_idx + 1 < len(self.layers)
+                                else None
+                            )
                         hidden_states = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
@@ -746,6 +763,7 @@ class HybridStack(MegatronModule):
                             packed_sequence_cp_metadata=layer_cp_metadata,
                             attn_recompute_context=residual_stream_recompute_context,
                             moe_recompute_context=moe_recompute_context,
+                            **fusion_kwargs,
                         )
                         residual_stream_recompute_context = moe_recompute_context
                     else:
@@ -828,8 +846,15 @@ class HybridStack(MegatronModule):
                                 physical_layer_idx, hidden_states
                             )
 
+                    if inverse_manager is not None:
+                        inverse_manager.finish_layer(physical_layers)
                     if residual_stream_recompute_context is not None:
-                        residual_stream_recompute_context.finalize(hidden_states)
+                        residual_stream_recompute_context.finalize(
+                            hidden_states.residual
+                            if getattr(layer, "fuses_shortcut_boundaries", False)
+                            and not torch.is_tensor(hidden_states)
+                            else hidden_states
+                        )
                     self._finalize_mhc_recompute_layer(
                         manager=mhc_manager,
                         hidden_states=hidden_states,

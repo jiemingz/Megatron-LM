@@ -87,6 +87,12 @@ def group_layers_into_shortcut_blocks(
             "boundary so each MoE layer stays on the same stage as the layer before it."
         )
 
+    block_type = ShortcutMoEBlock
+    if getattr(config, "wide_residual_shortcut_moe_kernel_fusion", False):
+        from megatron.core.models.hybrid.layers.shortcut_fusion import FusedShortcutMoEBlock
+
+        block_type = FusedShortcutMoEBlock
+
     grouped_layers = torch.nn.ModuleList()
     physical_index = 0
     while physical_index < len(layers):
@@ -115,8 +121,11 @@ def group_layers_into_shortcut_blocks(
                 f"Shortcut attention layer {paired_type!r} does not support two-stage attention"
             )
         moe_layer = layers[physical_index + 1]
+        pair_type = (
+            ShortcutMoEBlock if getattr(compute_layer, "is_mtp_layer", False) else block_type
+        )
         grouped_layers.append(
-            ShortcutMoEBlock(
+            pair_type(
                 compute_layer,
                 moe_layer,
                 overlap_a2a=config.moe_shortcut_parallel,
@@ -126,6 +135,12 @@ def group_layers_into_shortcut_blocks(
         )
         physical_index += 2
 
+    if (
+        block_type is not ShortcutMoEBlock
+        and not all(getattr(layer, "is_mtp_layer", False) for layer in layers)
+        and not any(isinstance(layer, block_type) for layer in grouped_layers)
+    ):
+        raise ValueError("shortcut kernel fusion requires an adjacent Mamba/GDN and MoE pair")
     return grouped_layers
 
 
