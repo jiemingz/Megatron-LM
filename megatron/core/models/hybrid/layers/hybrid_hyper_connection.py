@@ -1,9 +1,11 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from contextlib import nullcontext
 from typing import Optional, Tuple
 
 from torch import Tensor
 
+from megatron.core.activation_policy import ReplayRegion, ResidualBranch
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.layers import utils as layer_utils
@@ -41,6 +43,23 @@ class HyperConnectionHybridLayer(MegatronModule):
             convert_module_to_dtype_except_fp32_marked(self.hyper_connection, config.params_dtype)
         if hasattr(layer, 'tp_group'):
             self.tp_group = layer.tp_group
+
+    def get_inner_quantization_context(self):
+        """The wrapped layer's FP8/FP4 context (none if it has no per-layer context)."""
+        get_context = getattr(self.inner_layer, "get_inner_quantization_context", None)
+        return get_context() if get_context is not None else nullcontext()
+
+    def get_residual_branches(self) -> list[ResidualBranch]:
+        """The mHC read (``aggregate``), the H_post expansion and the layer-output write around
+        the wrapped layer."""
+        connection = self.hyper_connection
+        return [
+            ResidualBranch(
+                read=ReplayRegion(connection, connection.aggregate),
+                ops=(ReplayRegion(connection, connection._expand_h_post),),
+                write=ReplayRegion(connection, connection._h_res_h_post_bda_layer_output),
+            )
+        ]
 
     def mamba_state_shapes_per_request(self) -> Optional[Tuple[Tuple[int], Tuple[int]]]:
         """Delegate Mamba inference state shape requests to the wrapped layer."""
@@ -113,7 +132,6 @@ class HyperConnectionHybridLayer(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams],
         padding_mask: Optional[Tensor],
         input_ids: Optional[Tensor] = None,
-        mhc_recompute_manager=None,
     ) -> Optional[Tuple[Tuple[Tensor, Optional[Tensor]], Optional[Tensor], float, bool]]:
         """Return a raw branch output for split Hybrid TransformerLayer instances.
 
@@ -137,40 +155,33 @@ class HyperConnectionHybridLayer(MegatronModule):
         if has_cross_attention or has_attention == has_mlp:
             return None
 
+        # The mHC BDA in forward replaces the inner layer's own residual add, so this wrapper
+        # marks that boundary for the layer's deferred recompute/offload actions. (The inner
+        # layer's norms replay into the block's mHC manager via the scope set in forward.)
         if has_attention:
-            output_with_bias, attn_norm_manager, residual = (
-                layer._forward_self_attention_output_with_bias(
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    inference_context=inference_context,
-                    rotary_pos_emb=rotary_pos_emb,
-                    packed_seq_params=packed_seq_params,
-                    sequence_len_offset=sequence_len_offset,
-                    mhc_recompute_manager=mhc_recompute_manager,
-                )
+            output_with_bias, residual = layer._forward_self_attention_output_with_bias(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
             )
-            output_with_bias = layer._group_offload_output_with_bias(
-                output_with_bias, attn_norm_manager, forced_released_tensors=[residual]
+            bda = layer._self_attn_bda
+        else:
+            output_with_bias, residual = layer._forward_mlp_output_with_bias(
+                hidden_states,
+                inference_context=inference_context,
+                padding_mask=padding_mask,
+                packed_seq_params=packed_seq_params,
+                input_ids=input_ids,
             )
-            return output_with_bias, None, layer.hidden_dropout, layer.config.bias_dropout_fusion
-
-        output_with_bias, residual = layer._forward_mlp_output_with_bias(
-            hidden_states,
-            inference_context=inference_context,
-            padding_mask=padding_mask,
-            packed_seq_params=packed_seq_params,
-            input_ids=input_ids,
-            mhc_recompute_manager=mhc_recompute_manager,
+            bda = layer._mlp_bda
+        # The mHC update replaces the wrapped layer's residual add.
+        layer.fire_activation_boundary(bda, "enter", [output_with_bias[0]])
+        output_with_bias = layer.fire_activation_boundary(
+            bda, "exit", output_with_bias, inputs=(output_with_bias, residual)
         )
-        if layer.recompute_pre_mlp_layernorm or (
-            mhc_recompute_manager is not None and layer.mhc_checkpoint_pre_mlp_layernorm
-        ):
-            layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(output_with_bias[0])
-        if layer.mlp_norm_manager is not None:
-            output_with_bias = layer._group_offload_output_with_bias(
-                output_with_bias, layer.mlp_norm_manager, forced_released_tensors=[residual]
-            )
-            layer.mlp_norm_manager = None
         return output_with_bias, None, layer.hidden_dropout, layer.config.bias_dropout_fusion
 
     def forward(
@@ -183,12 +194,37 @@ class HyperConnectionHybridLayer(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask: Optional[Tensor] = None,
         packed_sequence_cp_metadata: Optional[PackedSequenceCPMetadata] = None,
-        mhc_recompute_manager=None,
         input_ids: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Run the wrapped hybrid layer through one layer-boundary mHC update."""
+        # The mHC update runs in the wrapped layer's quantization context, as the layer does.
+        with self.get_inner_quantization_context():
+            return self._forward(
+                hidden_states,
+                attention_mask,
+                inference_context,
+                rotary_pos_emb,
+                sequence_len_offset,
+                packed_seq_params,
+                padding_mask,
+                packed_sequence_cp_metadata,
+                input_ids,
+            )
+
+    def _forward(
+        self,
+        hidden_states,
+        attention_mask,
+        inference_context,
+        rotary_pos_emb,
+        sequence_len_offset,
+        packed_seq_params,
+        padding_mask,
+        packed_sequence_cp_metadata,
+        input_ids,
+    ):
         aggregated, h_res, h_post, residual = self.hyper_connection(
-            hidden_states, mhc_recompute_manager=mhc_recompute_manager, return_residual=True
+            hidden_states, return_residual=True
         )
         fast_path_result = self._call_inner_transformer_layer_without_local_bda(
             aggregated,
@@ -199,7 +235,6 @@ class HyperConnectionHybridLayer(MegatronModule):
             packed_seq_params,
             padding_mask,
             input_ids,
-            mhc_recompute_manager,
         )
 
         if fast_path_result is None:
@@ -230,11 +265,6 @@ class HyperConnectionHybridLayer(MegatronModule):
                 f"vs {tuple(aggregated.shape)} input."
             )
 
-        is_last_in_recompute_block = bool(
-            mhc_recompute_manager is not None
-            and getattr(mhc_recompute_manager, "is_last_layer_in_recompute_block", False)
-        )
-        mhc_bda_manager = None if is_last_in_recompute_block else mhc_recompute_manager
         hidden_states = self.hyper_connection.fused_h_res_h_post_bda(
             h_res,
             residual,
@@ -243,7 +273,7 @@ class HyperConnectionHybridLayer(MegatronModule):
             dropout_prob=dropout_prob,
             training=self.training,
             fused=bias_dropout_fusion,
-            manager=mhc_bda_manager,
+            layer_output=True,
         )
         if (
             self.config.fp32_residual_connection

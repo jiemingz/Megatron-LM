@@ -8,12 +8,11 @@ import pytest
 import torch
 from torch import nn
 
+from megatron.core.activation_policy import ReplayRegion, ResidualBranch
+from megatron.core.activation_policy.recompute.checkpointing import CheckpointWithoutOutputManager
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.random import (
-    CheckpointWithoutOutputManager,
-    model_parallel_cuda_manual_seed,
-)
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.hyper_connection_transformer_layer import (
@@ -21,15 +20,11 @@ from megatron.core.transformer.hyper_connection_transformer_layer import (
 )
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.module import TwoStageAttentionLayer
-from megatron.core.transformer.residual_recompute import (
-    ResidualStreamRecomputeContext,
-    build_residual_stream_recompute_plan,
-)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from megatron.core.transformer.wide_residual_transformer_layer import WideResidualTransformerLayer
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, install_residual_replay
 
 
 class _NormContext(nullcontext):
@@ -141,123 +136,6 @@ def test_dedicated_layer_clears_the_legacy_post_mlp_hook():
     assert value.grad is not None
 
 
-def _call_with_base(layer, body, *args, **kwargs):
-    """Call the layer, running body as its base call while the replay context is live."""
-    with patch.object(TransformerLayer, "__call__", side_effect=body) as base_call:
-        result = layer(*args, **kwargs)
-    base_call.assert_called_once()
-    assert layer._mhc_recompute_context is None
-    return result
-
-
-def _assert_norm_managers(layer, manager):
-    """Both norm overrides forward the live call's manager to the shared schedule."""
-    with (
-        patch.object(TransformerLayer, "_run_input_layernorm") as attention_norm,
-        patch.object(TransformerLayer, "_pre_mlp_layernorm_and_residual") as mlp_norm,
-    ):
-        layer._run_input_layernorm("input")
-        layer._pre_mlp_layernorm_and_residual("input")
-    attention_norm.assert_called_once_with("input", mhc_recompute_manager=manager)
-    mlp_norm.assert_called_once_with("input", mhc_recompute_manager=manager)
-
-
-def _hook_checker(layer, manager, mlp_context, others=()):
-    """Build a base call that checks the layer's live stage views and norm managers."""
-
-    def check(*args, **kwargs):
-        # A live context belongs to this layer's call only.
-        assert all(other._mhc_recompute_context is None for other in others)
-        attention_context = layer._residual_recompute_context()
-        if manager is None:
-            assert attention_context is None
-        else:
-            assert attention_context.manager is manager and not attention_context.is_block_end
-        assert layer._residual_recompute_context(is_mlp=True) is mlp_context
-        _assert_norm_managers(layer, manager)
-
-    return check
-
-
-def test_dedicated_context_is_live_only_during_the_call():
-    layer = _make_layer()
-    manager = CheckpointWithoutOutputManager()
-    context = ResidualStreamRecomputeContext(manager, is_block_end=True)
-    next_context = ResidualStreamRecomputeContext(
-        CheckpointWithoutOutputManager(), is_block_end=False
-    )
-    seen = []
-
-    def record(*args, **kwargs):
-        attention_view = layer._residual_recompute_context()
-        seen.append((kwargs, attention_view, layer._residual_recompute_context(is_mlp=True)))
-        return "base"
-
-    result = _call_with_base(
-        layer, record, "input", residual_stream_recompute_context=context, marker=1
-    )
-    assert result == "base"
-    kwargs, attention, mlp = seen.pop()
-    assert kwargs == {"marker": 1} and mlp is context
-    assert attention.manager is manager and not attention.is_block_end
-
-    _call_with_base(layer, record, "input", residual_stream_recompute_context=next_context)
-    assert seen.pop() == ({}, next_context, next_context)
-    # An explicit None for either keyword is stripped like an omitted keyword.
-    for omitted in (
-        {},
-        {"residual_stream_recompute_context": None},
-        {"mhc_recompute_manager": None},
-    ):
-        _call_with_base(layer, record, "input", **omitted)
-        assert seen.pop() == ({}, None, None)
-
-    # A failing call clears its context too.
-    with patch.object(TransformerLayer, "__call__", side_effect=RuntimeError("base failed")):
-        with pytest.raises(RuntimeError, match="base failed"):
-            layer("input", residual_stream_recompute_context=context)
-    assert layer._mhc_recompute_context is None
-
-    # The deprecated keyword snapshots the manager's mutable flag into an immutable context.
-    for legacy_boundary in (True, False):
-        manager.is_last_layer_in_recompute_block = legacy_boundary
-        with pytest.warns(DeprecationWarning, match="mhc_recompute_manager"):
-            result = _call_with_base(
-                layer, record, "input", mhc_recompute_manager=manager, marker=1
-            )
-        manager.is_last_layer_in_recompute_block = not legacy_boundary
-        kwargs, attention, mlp = seen.pop()
-        assert result == "base" and kwargs == {"marker": 1}
-        assert mlp.manager is manager and mlp.is_block_end is legacy_boundary
-        assert attention.manager is manager and not attention.is_block_end
-
-    with patch.object(TransformerLayer, "__call__", side_effect=record) as base_call:
-        with pytest.raises(ValueError, match="not both"):
-            layer("input", residual_stream_recompute_context=context, mhc_recompute_manager=manager)
-    base_call.assert_not_called()
-    assert not seen and layer._mhc_recompute_context is None
-
-
-def test_dedicated_context_preserves_shared_manager_and_immutable_boundaries():
-    layers = [_make_layer(), _make_layer()]
-    manager = CheckpointWithoutOutputManager()
-    contexts = [
-        ResidualStreamRecomputeContext(manager, is_block_end=False),
-        ResidualStreamRecomputeContext(manager, is_block_end=True),
-    ]
-
-    # The old mutable flag cannot change either layer's boundary or attention's view.
-    for legacy_boundary in (True, False):
-        manager.is_last_layer_in_recompute_block = legacy_boundary
-        for layer, context in zip(layers, contexts):
-            others = [other for other in layers if other is not layer]
-            checker = _hook_checker(layer, manager, context, others)
-            _call_with_base(layer, checker, "input", residual_stream_recompute_context=context)
-
-    # Without a context, the stage views are empty and the norms receive no manager.
-    _call_with_base(layers[0], _hook_checker(layers[0], None, None), "input")
-
-
 @pytest.mark.parametrize("stages", ["attention", "mlp", "both"])
 def test_optional_stages_construct_and_run_the_inherited_forward(stages):
     layer = _make_layer(stages)
@@ -346,7 +224,7 @@ class _TwoStageBranch(_Branch, TwoStageAttentionLayer):
 
 
 def test_attention_only_layers_do_not_advertise_two_stage_attention():
-    # The split entry points would bypass __call__, where mHC replay state enters.
+    # mHC layers run only through __call__; they must not advertise the split entry points.
     layer = _make_layer("attention", self_attention=_TwoStageBranch)
     assert TransformerLayer.supports_two_stage_attention(layer)
     assert not layer.supports_two_stage_attention()
@@ -408,21 +286,20 @@ def test_shared_layout_validation_preserves_wr_replay(stages, gpu_model_parallel
     eager = _make_layer(stages, layer_type=WideResidualTransformerLayer)
     replay = _make_layer(stages, layer_type=WideResidualTransformerLayer)
     replay.load_state_dict(eager.state_dict(), strict=True)
-    context = ResidualStreamRecomputeContext(CheckpointWithoutOutputManager(), is_block_end=True)
     initial = torch.randn(2, 1, 32, device=next(eager.parameters()).device)
-    expected = _forward_backward([eager], initial, [None])
-    actual = _forward_backward([replay], initial, [context])
+    expected = _forward_backward([eager], initial, None)
+    actual = _forward_backward([replay], initial, 1)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-def _finalize_with_storage_checks(context, boundary):
+def _finalize_with_storage_checks(finalize, manager, boundary, restoration_checks):
     # Pytest must not repr tensor arguments whose storage may have been released.
     __tracebackhide__ = True
     # These fixtures produce fresh checkpoint outputs with no retained-input exemptions.
     # Detached aliases observe the original storage; clones only record expected values.
     managed = [
         output.detach()
-        for checkpoint in context.manager.checkpoints
+        for checkpoint in manager.checkpoints
         for output in checkpoint.outputs
         if isinstance(output, torch.Tensor)
     ]
@@ -431,7 +308,7 @@ def _finalize_with_storage_checks(context, boundary):
         output.untyped_storage().nbytes() > 0 for output in managed
     ), "Registered outputs must be live before finalize"
     expected = [output.clone() for output in managed]
-    context.finalize(boundary)
+    finalize(manager, boundary)
     assert all(
         output.untyped_storage().nbytes() == 0 for output in managed
     ), "Finalize must release every registered output"
@@ -450,39 +327,49 @@ def _finalize_with_storage_checks(context, boundary):
         return gradient
 
     boundary.register_hook(check_restored)
-    return checked
+    restoration_checks.append(checked)
 
 
-def _run_layers(layers, value, contexts):
+def _run_layers(layers, value, block_size):
+    """Run ``layers`` as a stack; ``block_size`` residual-replays them (``None``: eager)."""
     # The boundary can alias this frame's value after a failed storage check.
     __tracebackhide__ = True
-    block_outputs = []
-    restoration_checks = []
-    for layer, context in zip(layers, contexts, strict=True):
-        previous_checkpoints = len(context.manager.checkpoints) if context is not None else 0
-        value, _ = layer(value, attention_mask=None, residual_stream_recompute_context=context)
-        if context is not None:
-            registered = len(context.manager.checkpoints)
-            assert registered > previous_checkpoints, "Each layer call must register replay work"
+    if block_size is None:
+        for layer in layers:
+            value, _ = layer(value, attention_mask=None)
+        return value, []
+    stack = install_residual_replay(layers, block_size=block_size)
+    block_outputs, restoration_checks, finalized = [], [], []
+    finalize = CheckpointWithoutOutputManager.discard_all_outputs_and_register_unified_recompute
+
+    def checked_finalize(manager, boundary):
+        finalized.append(boundary)
+        _finalize_with_storage_checks(finalize, manager, boundary, restoration_checks)
+
+    with patch.object(
+        CheckpointWithoutOutputManager,
+        "discard_all_outputs_and_register_unified_recompute",
+        checked_finalize,
+    ):
+        for index in range(len(layers)):
+            value, _ = stack._run_layer(index, value, attention_mask=None)
             block_outputs.append(value)
-            if context.is_block_end:
-                restoration_checks.append(_finalize_with_storage_checks(context, value))
+            if index in stack.replay.block_end_steps:
+                assert finalized and finalized[-1] is value, "The block ends on this output"
                 assert all(
                     output.untyped_storage().nbytes() == 0 for output in block_outputs[:-1]
                 ), "Finalize must release the block's nonterminal layer outputs"
                 block_outputs.clear()
-            else:
-                context.finalize(value)
     assert not block_outputs, "Every replay block needs a terminal boundary"
     return value, restoration_checks
 
 
-def _forward_backward(layers, initial, contexts):
+def _forward_backward(layers, initial, block_size):
     # Caller locals can retain released tensors too; preserve the raw traceback only.
     __tracebackhide__ = True
     torch.manual_seed(812)
     value = initial.detach().clone().requires_grad_()
-    output, restoration_checks = _run_layers(layers, value, contexts)
+    output, restoration_checks = _run_layers(layers, value, block_size)
     forward_rng = torch.get_rng_state()
     forward_cuda_rng = torch.cuda.get_rng_state(value.device) if value.is_cuda else None
     # Nonuniform weights expose changes that a uniform sum of residual streams can hide.
@@ -523,25 +410,20 @@ def test_optional_stages_replay_matches_eager_at_a_block_boundary(stages, gpu_mo
     eager = _make_layer(stages)
     replay = _make_layer(stages)
     replay.load_state_dict(eager.state_dict(), strict=True)
-    context = ResidualStreamRecomputeContext(CheckpointWithoutOutputManager(), is_block_end=True)
-    context.manager.is_last_layer_in_recompute_block = False
     calls = []
     for stage in ("self_attn", "mlp"):
-        for operation in ("read", "write"):
-            adapter = getattr(replay, f"residual_{operation}_{stage}")
-            if adapter is not None:
-                adapter.register_forward_pre_hook(
-                    lambda module, args, kwargs: calls.append(kwargs["recompute_context"]),
-                    with_kwargs=True,
-                )
+        adapter = getattr(replay, f"residual_write_{stage}")
+        if adapter is not None:
+            adapter.register_forward_pre_hook(
+                lambda module, args, kwargs: calls.append(kwargs["execution_context"].layer_output),
+                with_kwargs=True,
+            )
     initial = torch.randn(2, 1, 32, device=next(eager.parameters()).device)
-    expected = _forward_backward([eager], initial, [None])
-    actual = _forward_backward([replay], initial, [context])
+    expected = _forward_backward([eager], initial, None)
+    actual = _forward_backward([replay], initial, 1)
     _assert_mhc_replay_matches_eager(actual, expected)
-    assert all(stage_context.manager is context.manager for stage_context in calls)
-    assert [stage_context.is_block_end for stage_context in calls] == (
-        [False, False, True, True] if stages == "both" else [True, True]
-    )
+    # Only the layer's last write produces its (live) output.
+    assert calls == ([False, True] if stages == "both" else [True])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Output-discard replay needs CUDA")
@@ -556,13 +438,9 @@ def test_optional_stages_share_replay_blocks(stages, block_size, gpu_model_paral
     replay = [_make_layer(stage) for stage in stages]
     for source, target in zip(eager, replay):
         target.load_state_dict(source.state_dict(), strict=True)
-    contexts = build_residual_stream_recompute_plan(len(stages), block_size)
-    # A legacy manager flag must not override an immutable context, including in shared blocks.
-    for context in contexts:
-        context.manager.is_last_layer_in_recompute_block = not context.is_block_end
     initial = torch.randn(2, 1, 32, device=next(eager[0].parameters()).device)
-    expected = _forward_backward(eager, initial, [None] * len(stages))
-    actual = _forward_backward(replay, initial, contexts)
+    expected = _forward_backward(eager, initial, None)
+    actual = _forward_backward(replay, initial, block_size)
     _assert_mhc_replay_matches_eager(actual, expected)
 
 
@@ -574,36 +452,28 @@ def gpu_model_parallel():
     Utils.destroy_model_parallel()
 
 
+class _Boundary(nn.Module):
+    """A live layer output after the mHC layer: ends its replay block."""
+
+    def get_residual_branches_by_layer(self):
+        return [[ResidualBranch(write=ReplayRegion(self, self.boundary))]]
+
+    def forward(self, value):
+        return self.boundary(value)
+
+    def boundary(self, value):
+        return torch.square(value)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Output-discard replay needs CUDA")
 @pytest.mark.parametrize(
-    "terminal,norm_policy,no_grad",
-    [
-        (None, "none", False),
-        (False, "none", False),
-        (True, "mhc", False),
-        (True, "selective", False),
-        (None, "none", True),
-        (False, "none", True),
-        (True, "none", True),
-    ],
+    "terminal,no_grad",
+    [(None, False), (False, False), (True, False), (None, True), (False, True), (True, True)],
 )
 @torch.compiler.set_stance("force_eager")
-def test_dedicated_shared_schedule_preserves_mhc_policy(
-    terminal, norm_policy, no_grad, gpu_model_parallel
-):
+def test_dedicated_shared_schedule_preserves_mhc_policy(terminal, no_grad, gpu_model_parallel):
     layer = _make_layer()
-    layer.mhc_checkpoint_input_layernorm = layer.mhc_checkpoint_pre_mlp_layernorm = (
-        norm_policy == "mhc"
-    )
-    layer.recompute_input_layernorm = layer.recompute_pre_mlp_layernorm = norm_policy == "selective"
-    manager = None if terminal is None else CheckpointWithoutOutputManager()
-    context = (
-        None if manager is None else ResidualStreamRecomputeContext(manager, is_block_end=terminal)
-    )
-    if manager is not None:
-        # Actual residual operations must use the immutable layer context, not this flag.
-        manager.is_last_layer_in_recompute_block = not terminal
-    # Sharing adapters must not confuse stages, and owners remain replaceable at call time.
+    # Sharing adapters must not confuse stages, and owners remain replaceable after construction.
     device = next(layer.parameters()).device
     layer.self_attention_hyper_connection = HyperConnectionModule(layer.config, 2).to(device)
     layer.residual_read_mlp = layer.residual_read_self_attn
@@ -624,14 +494,14 @@ def test_dedicated_shared_schedule_preserves_mhc_policy(
     for adapter in (layer.residual_read_self_attn, layer.residual_write_self_attn):
         adapter.register_forward_pre_hook(
             lambda module, args, kwargs: calls.append(
-                (kwargs["execution_context"].owner, kwargs["recompute_context"])
+                (kwargs["execution_context"].owner, kwargs["execution_context"].layer_output)
             ),
             with_kwargs=True,
         )
     initial = torch.randn(2, 1, 32, device=device, requires_grad=True)
     biases = [torch.randn(8, device=device, requires_grad=True) for _ in owners]
 
-    def run_schedule(*args, **kwargs):
+    def run_schedule():
         value = initial
         with torch.no_grad() if no_grad else nullcontext():
             for index, (read, write) in enumerate(
@@ -648,21 +518,37 @@ def test_dedicated_shared_schedule_preserves_mhc_policy(
                 value = write((branch_output, biases[index]), residual, state)
         return value
 
-    # The residual and norm hooks see the context only while the layer's call runs.
-    value = _call_with_base(layer, run_schedule, "input", residual_stream_recompute_context=context)
+    # The layer is its block's end (terminal), or a later live boundary ends the block.
+    layers = [layer] if terminal else [layer, _Boundary()]
+    stack = (
+        install_residual_replay(layers, block_size=len(layers)) if terminal is not None else None
+    )
+    stack_steps = stack.steps if stack is not None else None
+    if stack_steps is not None:
+        stack_steps[0] = run_schedule
+    recorded = []
+    finalize = CheckpointWithoutOutputManager.discard_all_outputs_and_register_unified_recompute
+
+    def record(manager, boundary):
+        recorded.append(len(manager.checkpoints))
+        return finalize(manager, boundary)
+
+    with patch.object(
+        CheckpointWithoutOutputManager, "discard_all_outputs_and_register_unified_recompute", record
+    ):
+        value = run_schedule() if stack is None else stack._run_layer(0)
+        boundary = value.square() if terminal in (None, True) else stack._run_layer(1, value)
     assert [owner for owner, _ in calls] == [owners[0], owners[0], owners[1], owners[1]]
-    if manager is not None:
-        assert all(context.manager is manager for _, context in calls)
-        assert [context.is_block_end for _, context in calls] == [False, False, terminal, terminal]
-        expected = (2 if no_grad else 4 + 2 * (norm_policy != "none")) - int(terminal)
-        assert len(manager.checkpoints) == expected
-    else:
-        assert all(context is None for _, context in calls)
-    boundary = value.square().sum()
-    if manager is not None:
-        manager.discard_all_outputs_and_register_unified_recompute(boundary)
+    # Only the layer's last write produces its output.
+    assert [layer_output for _, layer_output in calls] == [False, False, False, True]
+    if stack is not None:
+        # Each stage's aggregation and norm (with grad) and every write but a terminal one.
+        expected = (0 if no_grad else 4) + 2 - int(terminal)
+        assert recorded == [expected]
         assert bool(value.untyped_storage().nbytes()) == terminal
-    boundary.backward()
+    else:
+        assert recorded == []
+    boundary.sum().backward()
     assert initial.grad is not None and all(bias.grad is not None for bias in biases)
     assert all((parameter.grad is None) == no_grad for parameter in layer.parameters())
     assert len(calls) == 4 and len(owner_outputs) == 2

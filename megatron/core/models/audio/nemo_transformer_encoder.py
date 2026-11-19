@@ -15,7 +15,8 @@ from torch import nn
 from torch.nn import GELU as TorchGELU
 from torch.nn import Conv1d
 from torch.nn.functional import scaled_dot_product_attention
-from torch.utils.checkpoint import checkpoint
+
+from megatron.core.activation_policy import CheckpointStrategy, install_activation_strategies
 
 logger = logging.getLogger(__name__)
 
@@ -961,6 +962,28 @@ class TransformerEncoder(nn.Module):
         self.layers = nn.ModuleList([TransformerBlock(cfg) for _ in range(n_layers)])
         self.layer_norm = nn.LayerNorm(d_model)
         self.final_norm = nn.LayerNorm(d_model)
+        # Activation strategies: with recompute_layers (--recompute-audio) each encoder layer
+        # (_run_layer) is checkpointed while training.
+        activation_strategies = []
+        if self.recompute_layers:
+            activation_strategies.append(
+                CheckpointStrategy(self._run_layer, impl="non_reentrant", training_only=True)
+            )
+        install_activation_strategies(self, activation_strategies)
+
+    def _run_layer(
+        self,
+        hidden: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        lengths: Optional[torch.Tensor] = None,
+        *,
+        layer: nn.Module,
+        packed_seq_params=None,
+    ) -> torch.Tensor:
+        """Run one encoder layer (recomputed with recompute_layers)."""
+        return layer(
+            hidden, attn_mask=attn_mask, lengths=lengths, packed_seq_params=packed_seq_params
+        )
 
     def forward(self, audio_signal, length, packed_seq_params=None, return_packed: bool = False):
         """
@@ -1024,14 +1047,8 @@ class TransformerEncoder(nn.Module):
                 x_packed = x[valid_mask]  # (Ttot, D)
 
                 for idx, layer in enumerate(self.layers):
-                    if self.recompute_layers and self.training and x_packed.requires_grad:
-                        x_packed = checkpoint(
-                            lambda hidden, layer=layer: layer(hidden, packed_seq_params=psp),
-                            x_packed,
-                            use_reentrant=False,
-                        )
-                    else:
-                        x_packed = layer(x_packed, packed_seq_params=psp)
+                    # Recomputed with recompute_layers (see activation strategies).
+                    x_packed = self._run_layer(x_packed, layer=layer, packed_seq_params=psp)
                     if self.nan_debug:
                         self._check_nan(x_packed, f"layer_{idx}")
 
@@ -1051,21 +1068,9 @@ class TransformerEncoder(nn.Module):
             attn_mask = pad_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T)
 
             for idx, layer in enumerate(self.layers):
-                if self.recompute_layers and self.training and x.requires_grad:
-                    x = checkpoint(
-                        lambda hidden, layer=layer: layer(
-                            hidden,
-                            attn_mask=attn_mask,
-                            lengths=length,
-                            packed_seq_params=packed_seq_params,
-                        ),
-                        x,
-                        use_reentrant=False,
-                    )
-                else:
-                    x = layer(
-                        x, attn_mask=attn_mask, lengths=length, packed_seq_params=packed_seq_params
-                    )
+                x = self._run_layer(
+                    x, attn_mask, length, layer=layer, packed_seq_params=packed_seq_params
+                )
                 if self.nan_debug:
                     self._check_nan(x, f"layer_{idx}")
             x = self.final_norm(x)

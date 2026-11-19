@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.activation_policy.recompute.checkpointing import CheckpointWithoutOutputManager
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.inference.contexts import StaticInferenceContext
@@ -19,14 +20,12 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
-    CheckpointWithoutOutputManager,
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
 from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
     _CudagraphGlobalRecord,
-    _CudaGraphRunner,
     create_cudagraphs,
 )
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
@@ -34,11 +33,6 @@ from megatron.core.transformer.hyper_connection_transformer_layer import (
     HyperConnectionTransformerLayer,
 )
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
-from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.residual_recompute import (
-    ResidualStreamRecomputeContext,
-    build_residual_stream_recompute_plan,
-)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     MoETransformerLayer,
@@ -47,7 +41,7 @@ from megatron.core.transformer.transformer_layer import (
     get_transformer_layer_offset,
 )
 from megatron.core.utils import is_te_min_version
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, install_residual_replay
 
 
 def _make_mhc_layer_spec(*, stages="both", **kwargs):
@@ -683,17 +677,9 @@ class TestTransformerLayerWithHyperConnectionRecompute:
             diagonal=1
         )
 
-        # Create manager for MHC block recomputation
-        manager = CheckpointWithoutOutputManager()
-
-        # Forward pass with the shared replay context at a block boundary.
-        output, context = layer(
-            hidden_states,
-            attention_mask=attention_mask,
-            residual_stream_recompute_context=ResidualStreamRecomputeContext(
-                manager, is_block_end=True
-            ),
-        )
+        # The layer alone is an mHC replay block (it ends the block).
+        stack = install_residual_replay([layer], block_size=1)
+        output, context = stack._run_layer(0, hidden_states, attention_mask=attention_mask)
 
         # Verify output shape
         assert output.shape == (
@@ -701,11 +687,6 @@ class TestTransformerLayerWithHyperConnectionRecompute:
             batch_size,
             n_channels,
         ), f"Expected output shape {(seq_len, batch_size, n_channels)}, got {output.shape}"
-
-        # Register unified recompute hook at block boundary.
-        assert layer._mhc_recompute_context is None, "The layer must clear its context"
-        assert manager.checkpoints, "The real mHC layer must register replay work"
-        manager.discard_all_outputs_and_register_unified_recompute(output)
 
         # Backward pass should work without error
         weights = torch.linspace(0.25, 1.25, output.numel(), device=output.device).reshape_as(
@@ -729,76 +710,11 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         layer.zero_grad(set_to_none=True)
         eager_input = hidden_states.detach().clone().requires_grad_(True)
         eager_output, _ = layer(eager_input, attention_mask=attention_mask)
-        assert layer._mhc_recompute_context is None
         (eager_output.square() * weights).sum().backward()
         torch.testing.assert_close(output, eager_output, rtol=1e-5, atol=1e-6)
         torch.testing.assert_close(hidden_states.grad, eager_input.grad, rtol=1e-5, atol=1e-6)
         for name, parameter in layer.named_parameters():
             torch.testing.assert_close(replay_gradients[name], parameter.grad, rtol=1e-5, atol=1e-6)
-
-    def _real_layer_inputs(self, config, seq_len=8, batch_size=2):
-        n_channels = config.mhc_num_residual_streams * config.hidden_size
-        hidden_states = torch.randn(
-            seq_len, batch_size, n_channels, device='cuda', requires_grad=True
-        )
-        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=torch.bool, device='cuda').triu(
-            diagonal=1
-        )
-        return hidden_states, attention_mask
-
-    def test_deprecated_manager_keyword_runs_real_replay(self):
-        """The deprecated keyword still drives real mHC replay, with a warning."""
-        layer, config = self._create_layer_with_hyper_connection()
-        layer.train()
-        hidden_states, attention_mask = self._real_layer_inputs(config)
-        manager = CheckpointWithoutOutputManager()
-        manager.is_last_layer_in_recompute_block = True
-
-        with pytest.warns(DeprecationWarning, match="mhc_recompute_manager"):
-            output, _ = layer(
-                hidden_states, attention_mask=attention_mask, mhc_recompute_manager=manager
-            )
-        assert manager.checkpoints, "The deprecated keyword must still register replay work"
-        assert layer._mhc_recompute_context is None
-        manager.discard_all_outputs_and_register_unified_recompute(output)
-        # Nonuniform weights expose changes that a uniform sum of residual streams can hide.
-        weights = torch.linspace(0.25, 1.25, output.numel(), device=output.device).reshape_as(
-            output
-        )
-        (output.square() * weights).sum().backward()
-
-        eager_input = hidden_states.detach().clone().requires_grad_(True)
-        eager_output, _ = layer(eager_input, attention_mask=attention_mask)
-        (eager_output.square() * weights).sum().backward()
-        torch.testing.assert_close(output, eager_output, rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(hidden_states.grad, eager_input.grad, rtol=1e-5, atol=1e-6)
-
-    def test_direct_module_call_after_public_call_sees_no_context(self):
-        """A call that bypasses __call__, as deferred local graph capture does, runs eagerly."""
-        layer, config = self._create_layer_with_hyper_connection()
-        layer.train()
-        hidden_states, attention_mask = self._real_layer_inputs(config)
-        manager = CheckpointWithoutOutputManager()
-        output, _ = layer(
-            hidden_states,
-            attention_mask=attention_mask,
-            residual_stream_recompute_context=ResidualStreamRecomputeContext(
-                manager, is_block_end=True
-            ),
-        )
-        registered = len(manager.checkpoints)
-        assert registered, "The public call must register replay work"
-
-        # _CudaGraphRunner's default func, used by deferred local capture, is this call. It
-        # bypasses the mHC entry point.
-        direct_input = hidden_states.detach().clone().requires_grad_(True)
-        direct_output, _ = super(MegatronModule, layer).__call__(
-            direct_input, attention_mask=attention_mask
-        )
-        assert len(manager.checkpoints) == registered, "Bypassing calls must not replay"
-        torch.testing.assert_close(direct_output, output, rtol=1e-5, atol=1e-6)
-        direct_output.sum().backward()
-        assert direct_input.grad is not None and torch.isfinite(direct_input.grad).all()
 
     def test_attention_only_layer_does_not_advertise_two_stage_attention(self):
         """Real attention supports two-stage execution, but the mHC layer must not offer it."""
@@ -826,16 +742,12 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         )
         attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
 
-        manager = CheckpointWithoutOutputManager()
-
         # Forward pass - NOT the last layer in block
-        output, context = layer(
-            hidden_states,
-            attention_mask=attention_mask,
-            residual_stream_recompute_context=ResidualStreamRecomputeContext(
-                manager, is_block_end=False
-            ),
+        next_layer, _ = self._create_layer_with_hyper_connection(
+            hidden_size, num_streams, layer_number=2, num_layers=2
         )
+        stack = install_residual_replay([layer, next_layer], block_size=2)
+        output, context = stack._run_layer(0, hidden_states, attention_mask=attention_mask)
 
         # Verify output shape
         assert output.shape == (seq_len, batch_size, n_channels)
@@ -843,7 +755,8 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         # Backward pass should work
         loss = output.sum()
         # For intermediate layers, we need to pass output to next layer
-        # Here we just register the recompute hook on output for testing
+        # Here we just release the open block onto the loss for testing
+        manager = stack.replay.release(0)
         manager.discard_all_outputs_and_register_unified_recompute(loss)
 
         loss.backward()
@@ -854,7 +767,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
     def test_multiple_layers_chain_with_recompute(self):
         """
         Test multiple TransformerLayers chained together with a single
-        CheckpointWithoutOutputManager, simulating TransformerBlock behavior.
+        replay block, simulating TransformerBlock behavior.
         """
         hidden_size = 64
         num_streams = 4
@@ -878,21 +791,13 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         )
         attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
 
-        # Single manager for all layers (like TransformerBlock)
-        manager = CheckpointWithoutOutputManager()
+        # One replay block for all layers (like TransformerBlock)
+        stack = install_residual_replay(layers, block_size=None)
 
         # Forward through all layers
         h = hidden_states
-        for i, layer in enumerate(layers):
-            recompute_context = ResidualStreamRecomputeContext(
-                manager, is_block_end=i == num_layers - 1
-            )
-            h, _ = layer(
-                h,
-                attention_mask=attention_mask,
-                residual_stream_recompute_context=recompute_context,
-            )
-            recompute_context.finalize(h)
+        for index in range(len(layers)):
+            h, _ = stack._run_layer(index, h, attention_mask=attention_mask)
 
         # Backward pass
         loss = h.sum()
@@ -1062,9 +967,8 @@ class TestMHCRecomputeMemorySaving:
     ):
         """Run a full forward + backward pass and return (peak memory, output grad).
 
-        When use_recompute=True, a new CheckpointWithoutOutputManager is created every
-        `recompute_block_size` layers, mirroring TransformerBlock's
-        build_residual_stream_recompute_plan logic.
+        When use_recompute=True, the layers are residual-replayed in blocks of
+        `recompute_block_size` layers, as TransformerBlock installs it.
         """
         config = _make_mhc_config(
             hidden_size=hidden_size,
@@ -1092,20 +996,18 @@ class TestMHCRecomputeMemorySaving:
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
 
-        contexts = (
-            build_residual_stream_recompute_plan(num_layers, recompute_block_size)
+        stack = (
+            install_residual_replay(layers, block_size=recompute_block_size)
             if use_recompute
-            else [None] * num_layers
+            else None
         )
 
         h = hidden_states
-        for layer, recompute_context in zip(layers, contexts):
-            kwargs = dict(attention_mask=attention_mask)
-            if recompute_context is not None:
-                kwargs["residual_stream_recompute_context"] = recompute_context
-            h, _ = layer(h, **kwargs)
-            if recompute_context is not None:
-                recompute_context.finalize(h)
+        for index, layer in enumerate(layers):
+            if stack is not None:
+                h, _ = stack._run_layer(index, h, attention_mask=attention_mask)
+            else:
+                h, _ = layer(h, attention_mask=attention_mask)
 
         loss = h.sum()
         loss.backward()
@@ -1114,7 +1016,7 @@ class TestMHCRecomputeMemorySaving:
         peak_mem = torch.cuda.max_memory_allocated()
         grad = hidden_states.grad.clone()
 
-        del layers, hidden_states, h, loss, contexts, recompute_context
+        del layers, hidden_states, h, loss, stack
         torch.cuda.empty_cache()
 
         return peak_mem, grad
@@ -1148,65 +1050,6 @@ class TestMHCRecomputeMemorySaving:
             f"recompute={peak_recompute / 1e6:.1f}MB "
             f"(saving={saving_pct:.1f}%)"
         )
-
-
-@pytest.mark.parametrize("has_mlp", [False, True])
-def test_mhc_context_is_cleared_before_deferred_cuda_graph_runner_call(has_mlp):
-    """The context is live only inside the public call; a deferred runner call sees none."""
-    layer = HyperConnectionTransformerLayer.__new__(HyperConnectionTransformerLayer)
-    MegatronModule.__init__(layer, _make_mhc_config(hidden_size=8, num_streams=2))
-    layer.residual_write_mlp = torch.nn.Identity() if has_mlp else None
-    manager = CheckpointWithoutOutputManager()
-    recompute_context = ResidualStreamRecomputeContext(manager, is_block_end=True)
-    hidden_states = torch.randn(2, 1, 16)
-    live_views = []
-
-    def record_live_views(*args, **kwargs):
-        # Eager execution and local graph recording run here, inside the public call.
-        live_views.append(
-            (layer._residual_recompute_context(), layer._residual_recompute_context(is_mlp=True))
-        )
-        return "recorded"
-
-    with patch.object(TransformerLayer, "__call__", side_effect=record_live_views) as base_call:
-        assert (
-            layer(hidden_states, residual_stream_recompute_context=recompute_context) == "recorded"
-        )
-    assert len(base_call.call_args.args) == 1
-    assert base_call.call_args.args[0] is hidden_states
-    assert not base_call.call_args.kwargs
-    [(attention_context, mlp_context)] = live_views
-    assert attention_context.manager is manager
-    assert attention_context.is_block_end == (not has_mlp)
-    assert mlp_context is recompute_context
-    if not has_mlp:
-        assert attention_context is recompute_context
-    assert layer._mhc_recompute_context is None
-
-    # Only the CUDA event is inert. The runner constructor chooses its real func, which
-    # bypasses HyperConnectionTransformerLayer.__call__ as deferred local graph capture does.
-    with patch("torch.cuda.Event"):
-        runner = _CudaGraphRunner(
-            base_module=layer,
-            mempool=0,
-            fwd_graph_input_args=list(base_call.call_args.args),
-            fwd_graph_input_kwargs=base_call.call_args.kwargs,
-            func=None,
-            need_backward=False,
-        )
-    assert len(runner.fwd_graph_input_arg_metas) == 1
-    assert not runner.fwd_graph_input_kwarg_metas
-
-    def forward(hidden_states):
-        # The block was finalized before deferred capture, so mHC must run without replay.
-        assert layer._residual_recompute_context() is None
-        assert layer._residual_recompute_context(is_mlp=True) is None
-        return hidden_states
-
-    with patch.object(layer, "forward", side_effect=forward) as deferred_forward:
-        assert runner.func(*base_call.call_args.args, **base_call.call_args.kwargs) is hidden_states
-    assert deferred_forward.call_count == 1
-    assert layer._mhc_recompute_context is None
 
 
 class TestMHCWithCudaGraph:
@@ -1383,9 +1226,9 @@ class TestMHCWithCudaGraph:
         )
 
     def test_cuda_graph_fwd_bwd_with_hyper_connection_and_recompute(self):
-        """CUDA graph capture+replay for fwd+bwd with mHC and CheckpointWithoutOutputManager.
+        """CUDA graph capture+replay for fwd+bwd with mHC residual replay.
 
-        When a CheckpointWithoutOutputManager is used, additional CheckpointWithoutOutput
+        Under residual replay, additional CheckpointWithoutOutput
         objects are created for layernorm and hyper-connection operations. The
         manager discards intermediate activations during forward (storage.resize_(0))
         and recomputes them during backward via a unified gradient hook.
@@ -1403,38 +1246,24 @@ class TestMHCWithCudaGraph:
         )
         attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
 
-        # Warmup on side stream; fresh manager per iteration to avoid stale state.
+        # The layer alone is a replay block; each forward gets a fresh manager.
+        stack = install_residual_replay([layer], block_size=1)
+
+        # Warmup on side stream.
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             for _ in range(3):
-                mgr = CheckpointWithoutOutputManager()
-                out, _ = layer(
-                    static_input,
-                    attention_mask=attention_mask,
-                    residual_stream_recompute_context=ResidualStreamRecomputeContext(
-                        mgr, is_block_end=True
-                    ),
-                )
-                mgr.discard_all_outputs_and_register_unified_recompute(out)
+                out, _ = stack._run_layer(0, static_input, attention_mask=attention_mask)
                 out.sum().backward()
         torch.cuda.current_stream().wait_stream(s)
 
         layer.zero_grad(set_to_none=True)
         static_input.grad = None
 
-        capture_mgr = CheckpointWithoutOutputManager()
-
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
-            output, _ = layer(
-                static_input,
-                attention_mask=attention_mask,
-                residual_stream_recompute_context=ResidualStreamRecomputeContext(
-                    capture_mgr, is_block_end=True
-                ),
-            )
-            capture_mgr.discard_all_outputs_and_register_unified_recompute(output)
+            output, _ = stack._run_layer(0, static_input, attention_mask=attention_mask)
             output.sum().backward()
 
         # Replay with new input data.
@@ -1462,16 +1291,8 @@ class TestMHCWithCudaGraph:
         graph_out = output.detach().clone()
         graph_grad = static_input.grad.detach().clone()
 
-        eager_mgr = CheckpointWithoutOutputManager()
         eager_input = test_data.clone().requires_grad_(True)
-        eager_output, _ = layer(
-            eager_input,
-            attention_mask=attention_mask,
-            residual_stream_recompute_context=ResidualStreamRecomputeContext(
-                eager_mgr, is_block_end=True
-            ),
-        )
-        eager_mgr.discard_all_outputs_and_register_unified_recompute(eager_output)
+        eager_output, _ = stack._run_layer(0, eager_input, attention_mask=attention_mask)
         eager_output.sum().backward()
 
         assert torch.allclose(graph_out, eager_output.detach(), atol=1e-5), (
@@ -1483,11 +1304,11 @@ class TestMHCWithCudaGraph:
             f"max diff = {(graph_grad - eager_input.grad).abs().max().item()}"
         )
 
-    def test_mcore_cudagraph_manager_with_residual_stream_recompute_context(self):
-        """The layer consumes the shared context before CUDA-graph argument validation.
+    def test_mcore_cudagraph_manager_with_mhc_residual_replay(self):
+        """MCore CudaGraphManager works on a layer whose mHC regions are residual-replayed.
 
-        The context contains a live manager that CUDA-graph kwargs cannot carry.
-        HyperConnectionTransformerLayer.__call__ holds it on the layer only while the call runs.
+        Residual replay hooks the layer's regions; nothing replay-related is passed through
+        the layer's kwargs, which CudaGraphManager checks for supported types.
         """
         layer, config = self._create_mhc_layer(cuda_graph_impl="local", cuda_graph_scope="attn")
         layer.train()
@@ -1505,26 +1326,30 @@ class TestMHCWithCudaGraph:
         )
         attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
 
-        mgr = CheckpointWithoutOutputManager()
+        stack = install_residual_replay([layer], block_size=1)
+        recorded = []
+        finalize = CheckpointWithoutOutputManager.discard_all_outputs_and_register_unified_recompute
 
-        output, context = layer(
-            hidden_states,
-            attention_mask=attention_mask,
-            residual_stream_recompute_context=ResidualStreamRecomputeContext(
-                mgr, is_block_end=True
-            ),
-        )
+        def record(manager, hook_tensor):
+            recorded.append(len(manager.checkpoints))
+            return finalize(manager, hook_tensor)
+
+        with patch.object(
+            CheckpointWithoutOutputManager,
+            "discard_all_outputs_and_register_unified_recompute",
+            record,
+        ):
+            output, context = stack._run_layer(0, hidden_states, attention_mask=attention_mask)
 
         assert output.shape == (seq_len, batch_size, n_channels)
         # The call took the local recording path, which runs the layer inside the call, so
-        # replay work reaches the manager.
+        # replay work reaches the block's manager.
         runners = layer.cudagraph_manager.cudagraph_runners
         assert len(runners) == 1 and runners[0].fwd_graph_recorded, "Expected a local graph record"
-        assert mgr.checkpoints, "mHC replay must stay active on the local CUDA-graph path"
-        assert layer._mhc_recompute_context is None
+        assert recorded and recorded[0], "mHC replay must stay active on the local CUDA-graph path"
 
-    def test_mcore_cudagraph_manager_without_residual_stream_recompute_context(self):
-        """MCore CudaGraphManager path works without a residual replay context."""
+    def test_mcore_cudagraph_manager_without_mhc_residual_replay(self):
+        """MCore CudaGraphManager path works without residual replay."""
         layer, config = self._create_mhc_layer(cuda_graph_impl="local", cuda_graph_scope="attn")
         layer.train()
 

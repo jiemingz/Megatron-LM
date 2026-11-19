@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.activation_policy import CheckpointWithoutOutputStrategy, has_strategy
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_experimental_attention_variant_module_spec,
 )
@@ -78,10 +79,11 @@ class TestGatedDeltaNet(GatedDeltaNetTestBase):
         model_parallel_cuda_manual_seed(42)
         torch.manual_seed(42)
         base_gdn = build_gdn(base_config)
-        assert base_gdn.recompute_norm_out is False
+        assert not has_strategy(
+            base_gdn, base_gdn._gated_norm_and_a2a, CheckpointWithoutOutputStrategy
+        )
         base_output, base_grads, base_input_grad = run(base_gdn, hidden_states)
         hidden_states.grad = None
-        assert base_gdn.norm_out_checkpoint is None
         del base_gdn
         torch.cuda.empty_cache()
 
@@ -89,9 +91,8 @@ class TestGatedDeltaNet(GatedDeltaNetTestBase):
         model_parallel_cuda_manual_seed(42)
         torch.manual_seed(42)
         rec_gdn = build_gdn(rec_config)
-        assert rec_gdn.recompute_norm_out is True
+        assert has_strategy(rec_gdn, rec_gdn._gated_norm_and_a2a, CheckpointWithoutOutputStrategy)
         rec_output, rec_grads, rec_input_grad = run(rec_gdn, hidden_states)
-        assert rec_gdn.norm_out_checkpoint is not None
 
         rank = torch.distributed.get_rank()
         assert torch.equal(rec_output, base_output), f"Output not identical ({rank=})"

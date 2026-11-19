@@ -20,6 +20,7 @@ import torch.nn.functional as F
 
 import megatron.core.extensions.transformer_engine as te_ext
 from megatron.core import parallel_state
+from megatron.core.activation_policy import CheckpointStrategy, has_strategy
 from megatron.core.activations import squared_relu
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.utils import InferenceMode
@@ -1998,7 +1999,7 @@ class TestMoEModules:
             ).submodules.mlp
         layer = MoELayer(config, get_submodules(mlp_spec)).cuda().train()
         layer.set_layer_number(0)
-        assert layer.moe_layer_recompute is recompute
+        assert has_strategy(layer, layer._moe_forward, CheckpointStrategy) is recompute
         replay = layer.router.router_replay
         hidden = torch.randn(2048, 2, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         # Distinct experts per token, deliberately unlike the router's own choice.

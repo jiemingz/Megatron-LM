@@ -20,7 +20,11 @@ from typing import NoReturn, Optional, Union
 
 import torch
 
-from megatron.core import tensor_parallel
+from megatron.core.activation_policy import (
+    CheckpointStrategy,
+    CheckpointWithoutOutputStrategy,
+    Event,
+)
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.models.common.embeddings import (
@@ -205,6 +209,12 @@ class AbsorbedMLASelfAttention(Attention):
             is_mtp_layer=is_mtp_layer,
         )
 
+        if self.config.recompute_selected("mla_up_proj"):
+            if self.config.fp8 or self.config.fp4:
+                raise ValueError("FP8/FP4 is not supported for AbsorbedMLA")
+        elif self.config.cache_mla_latents:
+            raise ValueError("cache_mla_latents is not supported for AbsorbedMLA")
+
         # Resolve which classes to use for Q and KV linear up projections and norms, based on
         # QK-norm selection.
         layer_classes = QKNormConfigResolver(self.config, submodules).resolve()
@@ -220,12 +230,6 @@ class AbsorbedMLASelfAttention(Attention):
         # Inference is currently not supported.
         self.key_hidden_size = None
         self.val_hidden_size = None
-
-        self.recompute_up_proj = (
-            self.config.recompute_granularity == 'selective'
-            and "mla_up_proj" in self.config.recompute_modules
-        )
-        self.qkv_up_checkpoint = None
 
         mscale = _yarn_get_mscale(self.config.rotary_scaling_factor, self.config.mscale_all_dim)
         self.softmax_scale = mscale * mscale / math.sqrt(self.q_head_dim)
@@ -446,6 +450,21 @@ class AbsorbedMLASelfAttention(Attention):
             config=self.config,
             eps=self.config.layernorm_epsilon,
         )
+        # Activation strategies (replacing Attention's; points: _qkv_up_proj_and_rope,
+        # core_attention, linear_proj). Absorbed MLA supports no activation offloading.
+        config = self.config
+        activation_strategies = []
+        if config.recompute_selected("core_attn"):
+            activation_strategies.append(
+                CheckpointStrategy(self.core_attention, impl="tensor_parallel", training_only=True)
+            )
+        if config.recompute_selected("mla_up_proj"):
+            activation_strategies.append(
+                CheckpointWithoutOutputStrategy(
+                    self._qkv_up_proj_and_rope, release_on=Event(self.linear_proj, "enter")
+                )
+            )
+        self.install_activation_strategies(activation_strategies)
 
     def get_query_key_value_tensors(
         self,
@@ -600,165 +619,184 @@ class AbsorbedMLASelfAttention(Attention):
         # QKV up projection and RoPE apply
         # =========================================
 
-        def qkv_up_proj_and_rope_apply(q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb):
-            """
-            Apply the up projection and RoPE to the query and key.
-            When sequence packing enabled, the input tensors adopt a packed shape of [t, ...];
-            otherwise, they maintain the unpacked shape [s, b, ...]. In subsequent code comments,
-            we uniformly use [num_tokens, ...] to denote [s, b, ...] or [t, ...] for two cases.
-            """
-            if self.config.q_lora_rank is not None:
-                # q_compressed: [num_tokens, q_lora_rank]
-                # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
-                with self._mla_projection_context():
-                    q, _ = self.linear_q_up_proj(q_compressed)
-            else:
-                # q_compressed: [num_tokens, hidden_size]
-                # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
-                with self._mla_projection_context():
-                    q, _ = self.linear_q_proj(q_compressed)
-
-            # q: [num_tokens, n, q_head_dim]
-            q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
-
-            # [num_tokens, kv_lora_rank] -> [num_tokens, 1, kv_lora_rank]
-            kv_compressed = torch.unsqueeze(kv_compressed, -2)
-
-            k_up_weight, _ = self._get_kv_up_weights()
-
-            if not self.use_rope:
-                q_absorbed = torch.einsum("...nd,ndk->...nk", q, k_up_weight)
-                q_absorbed = q_absorbed.contiguous()
-                assert q_absorbed.size(-1) == self.config.kv_lora_rank
-                assert q_absorbed.is_contiguous()
-                assert kv_compressed.is_contiguous()
-                # CheckpointWithoutOutput discards output storage; do not alias its saved input.
-                return q_absorbed, kv_compressed.clone()
-
-            # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
-            k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
-
-            if self.config.apply_rope_fusion:
-                # q_no_pe: [num_tokens, n, qk_head_dim]
-                # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
-                q_no_pe, q_pos_emb = torch.split(
-                    q, [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim], dim=-1
-                )
-
-                # Absorb k_up_weight into q_no_pe
-                # q_absorbed: [num_tokens, n, kv_lora_rank]
-                q_absorbed = torch.einsum("...nd,ndk->...nk", q_no_pe, k_up_weight)
-                q_absorbed = q_absorbed.contiguous()
-                assert q_absorbed.ndim == q.ndim
-                assert q_absorbed.shape[:-1] == q.shape[:-1]
-                assert q_absorbed.size(-1) == self.config.kv_lora_rank
-
-                # q_absorbed: [num_tokens, n, (kv_lora_rank + qk_pos_emb_head_dim)]
-                q_absorbed = torch.cat([q_absorbed, q_pos_emb], dim=-1)
-                # kv_compressed: [num_tokens, 1, (kv_lora_rank + qk_pos_emb_head_dim)]
-                kv_compressed = torch.cat([kv_compressed, k_pos_emb], dim=-1)
-
-                cp_rank = runtime_cp_group.rank()
-                cp_size = runtime_cp_group.size()
-                q_absorbed = fused_apply_mla_rope_for_q(
-                    q_absorbed,
-                    rotary_pos_cos,
-                    rotary_pos_sin,
-                    self.config.kv_lora_rank,
-                    self.config.qk_pos_emb_head_dim,
-                    cu_seqlens_q,
-                    cp_rank,
-                    cp_size,
-                )
-                kv_compressed = fused_apply_mla_rope_for_q(
-                    kv_compressed,
-                    rotary_pos_cos,
-                    rotary_pos_sin,
-                    self.config.kv_lora_rank,
-                    self.config.qk_pos_emb_head_dim,
-                    cu_seqlens_kv,
-                    cp_rank,
-                    cp_size,
-                )
-            else:
-                q_len = q.size()[0]
-                if inference_context is not None:
-                    # add offset to the sequence start for inference
-                    sequence_start = inference_context.sequence_len_offset
-                    sequence_end = sequence_start + q_len
-                    rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
-                elif packed_seq_params is None or runtime_cp_group.size() == 1:
-                    # Shorten rotary_pos_emb to the sequence length when inference_params
-                    # is not provided. This makes sure we can run forward directly with
-                    # any sequence length. During training, the sequence length is always
-                    # the full rotary_pos_emb length, except for sequence packing + CP.
-                    # When sequence packing and context parallel are both enabled, the
-                    # position embedding will not split rotary_pos_emb, so it may exceed
-                    # the sequence length on this CP rank, but we need the full rotary_pos_emb
-                    # to cover the full sequence, so we do not shorten it here.
-                    rotary_pos_emb = rotary_pos_emb[0:q_len]
-
-                # q_no_pe: [num_tokens, n, qk_head_dim]
-                # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
-                q_no_pe, q_pos_emb = torch.split(
-                    q, [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim], dim=-1
-                )
-
-                # Absorb k_up_weight into q_no_pe
-                # q_absorbed: [num_tokens, n, kv_lora_rank]
-                q_absorbed = torch.einsum("...nd,ndk->...nk", q_no_pe, k_up_weight)
-                q_absorbed = q_absorbed.contiguous()
-                assert q_absorbed.ndim == q.ndim
-                assert q_absorbed.shape[:-1] == q.shape[:-1]
-                assert q_absorbed.size(-1) == self.config.kv_lora_rank
-
-                # Apply RoPE to q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
-                q_pos_emb = apply_rotary_pos_emb(
-                    q_pos_emb,
-                    rotary_pos_emb,
-                    config=self.config,
-                    cu_seqlens=cu_seqlens_q,
-                    mscale=mscale,
-                    cp_group=runtime_cp_group,
-                    mla_rotary_interleaved=True,
-                    max_seqlen=rope_freqs_max_seqlen,
-                )
-                # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
-                k_pos_emb = apply_rotary_pos_emb(
-                    k_pos_emb,
-                    rotary_pos_emb,
-                    config=self.config,
-                    cu_seqlens=cu_seqlens_kv,
-                    mscale=mscale,
-                    cp_group=runtime_cp_group,
-                    mla_rotary_interleaved=True,
-                    max_seqlen=rope_freqs_max_seqlen,
-                )
-
-                # query: [num_tokens, n, (kv_lora_rank + qk_pos_emb_head_dim)]
-                q_absorbed = torch.cat([q_absorbed, q_pos_emb], dim=-1)
-                # key: [num_tokens, 1, (kv_lora_rank + qk_pos_emb_head_dim)]
-                kv_compressed = torch.cat([kv_compressed, k_pos_emb], dim=-1)
-
-            assert q_absorbed.is_contiguous()
-            assert kv_compressed.is_contiguous()
-
-            return q_absorbed, kv_compressed
-
-        if self.recompute_up_proj:
-            quantization = self.config.fp8 or self.config.fp4
-            assert not quantization, "FP8/FP4 is not supported for AbsorbedMLA"
-            self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=quantization)
-            q_absorbed, kv_compressed = self.qkv_up_checkpoint.checkpoint(
-                qkv_up_proj_and_rope_apply, q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
-            )
-        else:
-            assert not self.cache_mla_latents, "cache_mla_latents is not supported for AbsorbedMLA"
-            q_absorbed, kv_compressed = qkv_up_proj_and_rope_apply(
-                q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
-            )
+        q_absorbed, kv_compressed = self._qkv_up_proj_and_rope(
+            q_compressed,
+            kv_compressed,
+            k_pos_emb,
+            rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            mscale=mscale,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            rope_freqs_max_seqlen=rope_freqs_max_seqlen,
+            runtime_cp_group=runtime_cp_group,
+            inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
+        )
 
         return q_absorbed, kv_compressed, q_compressed
+
+    def _qkv_up_proj_and_rope(
+        self,
+        q_compressed,
+        kv_compressed,
+        k_pos_emb,
+        rotary_pos_emb,
+        *,
+        rotary_pos_cos,
+        rotary_pos_sin,
+        mscale,
+        cu_seqlens_q,
+        cu_seqlens_kv,
+        rope_freqs_max_seqlen,
+        runtime_cp_group,
+        inference_context,
+        packed_seq_params,
+    ):
+        """
+        Apply the up projection and RoPE to the query and key.
+        When sequence packing enabled, the input tensors adopt a packed shape of [t, ...];
+        otherwise, they maintain the unpacked shape [s, b, ...]. In subsequent code comments,
+        we uniformly use [num_tokens, ...] to denote [s, b, ...] or [t, ...] for two cases.
+        """
+        if self.config.q_lora_rank is not None:
+            # q_compressed: [num_tokens, q_lora_rank]
+            # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
+            with self._mla_projection_context():
+                q, _ = self.linear_q_up_proj(q_compressed)
+        else:
+            # q_compressed: [num_tokens, hidden_size]
+            # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
+            with self._mla_projection_context():
+                q, _ = self.linear_q_proj(q_compressed)
+
+        # q: [num_tokens, n, q_head_dim]
+        q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
+
+        # [num_tokens, kv_lora_rank] -> [num_tokens, 1, kv_lora_rank]
+        kv_compressed = torch.unsqueeze(kv_compressed, -2)
+
+        k_up_weight, _ = self._get_kv_up_weights()
+
+        if not self.use_rope:
+            q_absorbed = torch.einsum("...nd,ndk->...nk", q, k_up_weight)
+            q_absorbed = q_absorbed.contiguous()
+            assert q_absorbed.size(-1) == self.config.kv_lora_rank
+            assert q_absorbed.is_contiguous()
+            assert kv_compressed.is_contiguous()
+            # CheckpointWithoutOutput discards output storage; do not alias its saved input.
+            return q_absorbed, kv_compressed.clone()
+
+        # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
+        k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
+
+        if self.config.apply_rope_fusion:
+            # q_no_pe: [num_tokens, n, qk_head_dim]
+            # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
+            q_no_pe, q_pos_emb = torch.split(
+                q, [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim], dim=-1
+            )
+
+            # Absorb k_up_weight into q_no_pe
+            # q_absorbed: [num_tokens, n, kv_lora_rank]
+            q_absorbed = torch.einsum("...nd,ndk->...nk", q_no_pe, k_up_weight)
+            q_absorbed = q_absorbed.contiguous()
+            assert q_absorbed.ndim == q.ndim
+            assert q_absorbed.shape[:-1] == q.shape[:-1]
+            assert q_absorbed.size(-1) == self.config.kv_lora_rank
+
+            # q_absorbed: [num_tokens, n, (kv_lora_rank + qk_pos_emb_head_dim)]
+            q_absorbed = torch.cat([q_absorbed, q_pos_emb], dim=-1)
+            # kv_compressed: [num_tokens, 1, (kv_lora_rank + qk_pos_emb_head_dim)]
+            kv_compressed = torch.cat([kv_compressed, k_pos_emb], dim=-1)
+
+            cp_rank = runtime_cp_group.rank()
+            cp_size = runtime_cp_group.size()
+            q_absorbed = fused_apply_mla_rope_for_q(
+                q_absorbed,
+                rotary_pos_cos,
+                rotary_pos_sin,
+                self.config.kv_lora_rank,
+                self.config.qk_pos_emb_head_dim,
+                cu_seqlens_q,
+                cp_rank,
+                cp_size,
+            )
+            kv_compressed = fused_apply_mla_rope_for_q(
+                kv_compressed,
+                rotary_pos_cos,
+                rotary_pos_sin,
+                self.config.kv_lora_rank,
+                self.config.qk_pos_emb_head_dim,
+                cu_seqlens_kv,
+                cp_rank,
+                cp_size,
+            )
+        else:
+            q_len = q.size()[0]
+            if inference_context is not None:
+                # add offset to the sequence start for inference
+                sequence_start = inference_context.sequence_len_offset
+                sequence_end = sequence_start + q_len
+                rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
+            elif packed_seq_params is None or runtime_cp_group.size() == 1:
+                # Shorten rotary_pos_emb to the sequence length when inference_params
+                # is not provided. This makes sure we can run forward directly with
+                # any sequence length. During training, the sequence length is always
+                # the full rotary_pos_emb length, except for sequence packing + CP.
+                # When sequence packing and context parallel are both enabled, the
+                # position embedding will not split rotary_pos_emb, so it may exceed
+                # the sequence length on this CP rank, but we need the full rotary_pos_emb
+                # to cover the full sequence, so we do not shorten it here.
+                rotary_pos_emb = rotary_pos_emb[0:q_len]
+
+            # q_no_pe: [num_tokens, n, qk_head_dim]
+            # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
+            q_no_pe, q_pos_emb = torch.split(
+                q, [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim], dim=-1
+            )
+
+            # Absorb k_up_weight into q_no_pe
+            # q_absorbed: [num_tokens, n, kv_lora_rank]
+            q_absorbed = torch.einsum("...nd,ndk->...nk", q_no_pe, k_up_weight)
+            q_absorbed = q_absorbed.contiguous()
+            assert q_absorbed.ndim == q.ndim
+            assert q_absorbed.shape[:-1] == q.shape[:-1]
+            assert q_absorbed.size(-1) == self.config.kv_lora_rank
+
+            # Apply RoPE to q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
+            q_pos_emb = apply_rotary_pos_emb(
+                q_pos_emb,
+                rotary_pos_emb,
+                config=self.config,
+                cu_seqlens=cu_seqlens_q,
+                mscale=mscale,
+                cp_group=runtime_cp_group,
+                mla_rotary_interleaved=True,
+                max_seqlen=rope_freqs_max_seqlen,
+            )
+            # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
+            k_pos_emb = apply_rotary_pos_emb(
+                k_pos_emb,
+                rotary_pos_emb,
+                config=self.config,
+                cu_seqlens=cu_seqlens_kv,
+                mscale=mscale,
+                cp_group=runtime_cp_group,
+                mla_rotary_interleaved=True,
+                max_seqlen=rope_freqs_max_seqlen,
+            )
+
+            # query: [num_tokens, n, (kv_lora_rank + qk_pos_emb_head_dim)]
+            q_absorbed = torch.cat([q_absorbed, q_pos_emb], dim=-1)
+            # key: [num_tokens, 1, (kv_lora_rank + qk_pos_emb_head_dim)]
+            kv_compressed = torch.cat([kv_compressed, k_pos_emb], dim=-1)
+
+        assert q_absorbed.is_contiguous()
+        assert kv_compressed.is_contiguous()
+
+        return q_absorbed, kv_compressed
 
     def _get_v_up_weight(self) -> torch.Tensor:
         """Return V up-projection weight in per-head layout."""
@@ -821,60 +859,6 @@ class AbsorbedMLASelfAttention(Attention):
 
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
-    def _checkpointed_attention_forward(
-        self,
-        q_absorbed,
-        k_compressed,
-        hidden_states,
-        q_compressed,
-        attention_mask,
-        up_v_weight,
-        position_ids=None,
-        attn_mask_type=None,
-        packed_seq_params=None,
-    ):
-        """Forward method with selective activation checkpointing."""
-
-        def custom_forward(*inputs):
-            q_absorbed = inputs[0]
-            k_compressed = inputs[1]
-            hidden_states = inputs[2]
-            q_compressed = inputs[3]
-            attention_mask = inputs[4]
-            up_v_weight = inputs[5]
-            attn_mask_type = inputs[6]
-            attn_mask_type = AttnMaskType(attn_mask_type.item())
-            output_ = self.core_attention(
-                q_absorbed,
-                k_compressed,
-                value=None,
-                attention_mask=attention_mask,
-                x=hidden_states,
-                qr=q_compressed,
-                up_v_weight=up_v_weight,
-                position_ids=position_ids,
-                attn_mask_type=attn_mask_type,
-                packed_seq_params=packed_seq_params,
-            )
-            return output_
-
-        if attn_mask_type is None:
-            attn_mask_type = self.attn_mask_type
-        attn_mask_type = torch.tensor([attn_mask_type.value], dtype=torch.int)
-        hidden_states = tensor_parallel.checkpoint(
-            custom_forward,
-            False,
-            q_absorbed,
-            k_compressed,
-            hidden_states,
-            q_compressed,
-            attention_mask,
-            up_v_weight,
-            attn_mask_type,
-        )
-
-        return hidden_states
-
     def forward(
         self,
         hidden_states,
@@ -921,30 +905,18 @@ class AbsorbedMLASelfAttention(Attention):
         # ==================================
         # Core attention computation
         # ==================================
-        if self.checkpoint_core_attention and self.training:
-            core_attn_out = self._checkpointed_attention_forward(
-                q_absorbed,
-                kv_compressed,
-                hidden_states,
-                q_compressed,
-                attention_mask,
-                v_up_weight,
-                position_ids=position_ids,
-                packed_seq_params=packed_seq_params,
-            )
-        else:
-            core_attn_out = self.core_attention(
-                q_absorbed,
-                kv_compressed,
-                value=None,
-                attention_mask=attention_mask,
-                x=hidden_states,
-                qr=q_compressed,
-                up_v_weight=v_up_weight,
-                position_ids=position_ids,
-                packed_seq_params=packed_seq_params,
-                attn_mask_type=self.attn_mask_type,
-            )
+        core_attn_out = self.core_attention(
+            q_absorbed,
+            kv_compressed,
+            value=None,
+            attention_mask=attention_mask,
+            x=hidden_states,
+            qr=q_compressed,
+            up_v_weight=v_up_weight,
+            position_ids=position_ids,
+            packed_seq_params=packed_seq_params,
+            attn_mask_type=self.attn_mask_type,
+        )
 
         # ==================================
         # Apply V up projection
@@ -977,11 +949,6 @@ class AbsorbedMLASelfAttention(Attention):
         assert core_attn_out.size(-1) == (
             self.config.v_head_dim * self.num_attention_heads_per_partition
         )
-
-        if self.recompute_up_proj:
-            assert self.qkv_up_checkpoint is not None
-            self.qkv_up_checkpoint.discard_output_and_register_recompute(core_attn_out)
-            self.qkv_up_checkpoint = None
 
         # =================
         # Output. [sq, b, h]

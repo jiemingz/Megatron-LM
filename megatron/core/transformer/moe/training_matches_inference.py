@@ -19,6 +19,7 @@ import torch
 from torch.distributed.tensor import DTensor
 from torch.optim.optimizer import register_optimizer_step_post_hook
 
+from megatron.core.activation_policy.recompute.checkpointing import precision_aware_checkpoint
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
     flashinfer_routed_mxfp8_moe,
     prepare_routed_mxfp8_weights,
@@ -35,7 +36,6 @@ from megatron.core.inference.quantization.utils import (
 )
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.transformer.moe.batch_invariant import unpermute_with_bf16_rank_partials
-from megatron.core.transformer.utils import precision_aware_checkpoint
 from megatron.core.typed_torch import apply_module
 
 if TYPE_CHECKING:

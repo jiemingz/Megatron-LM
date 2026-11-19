@@ -23,6 +23,7 @@ import torch
 from torch.utils._pytree import tree_flatten as tree_flatten_pyt
 from torch.utils._pytree import tree_map as tree_map_pyt
 
+from megatron.core.activation_policy.recompute.checkpointing import is_checkpointing
 from megatron.core.extensions.te_cuda_graphs import TECudaGraphMixin
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -32,7 +33,6 @@ from megatron.core.tensor_parallel.random import (
     cudagraph_needs_generator_registration,
     get_all_rng_states,
     get_cuda_rng_tracker,
-    is_checkpointing,
 )
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.enums import CudaGraphModule
@@ -2882,7 +2882,7 @@ class TECudaGraphHelper:
             else:
                 kwargs['fp8_enabled'] = False
 
-            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            from megatron.core.activation_policy.offload.manager import (
                 FineGrainedActivationOffloadingInterface as off_interface,
             )
 
@@ -2939,7 +2939,7 @@ class TECudaGraphHelper:
         )
         _set_capture_end()
 
-        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        from megatron.core.activation_policy.offload.manager import (
             FineGrainedActivationOffloadingInterface as off_interface,
         )
 

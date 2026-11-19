@@ -18,7 +18,8 @@ from typing import Literal, TypedDict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
+
+from megatron.core.activation_policy import CheckpointStrategy, install_activation_strategies
 
 from .nemo_transformer_encoder import StackingSubsampling
 
@@ -366,6 +367,33 @@ class RopeTransformerEncoder(nn.Module):
             [TransformerBlock(config, rope=self.pos_enc) for _ in range(config.n_layers)]
         )
         self.final_norm = nn.LayerNorm(config.d_model)
+        # Activation strategies: with recompute_layers (--recompute-audio) each encoder layer
+        # (_run_layer) is checkpointed while training.
+        activation_strategies = []
+        if self.config.recompute_layers:
+            activation_strategies.append(
+                CheckpointStrategy(self._run_layer, impl="non_reentrant", training_only=True)
+            )
+        install_activation_strategies(self, activation_strategies)
+
+    def _run_layer(
+        self,
+        hidden: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        *,
+        layer: TransformerBlock,
+        max_seqlen: int,
+        is_causal: bool,
+        attention_policies: _PackedAttentionPolicies | None = None,
+    ) -> torch.Tensor:
+        """Run one encoder layer on packed tokens (recomputed with recompute_layers)."""
+        return layer.forward_packed(
+            hidden,
+            cu_seqlens,
+            max_seqlen,
+            is_causal=is_causal,
+            attention_policies=attention_policies,
+        )
 
     def forward(
         self,
@@ -457,25 +485,14 @@ class RopeTransformerEncoder(nn.Module):
         self.pos_enc.extend_pe(max_seqlen, x.device, x.dtype)
         x = self.embed_norm(x)
         for layer in self.layers:
-            if self.config.recompute_layers and self.training and x.requires_grad:
-                x = checkpoint(
-                    lambda hidden, layer=layer: layer.forward_packed(
-                        hidden,
-                        cu_seqlens,
-                        max_seqlen,
-                        is_causal=causal_mask,
-                        attention_policies=attention_policies,
-                    ),
-                    x,
-                    use_reentrant=False,
-                )
-            else:
-                x = layer.forward_packed(
-                    x,
-                    cu_seqlens,
-                    max_seqlen,
-                    is_causal=causal_mask,
-                    attention_policies=attention_policies,
-                )
+            # Recomputed with recompute_layers (see activation strategies).
+            x = self._run_layer(
+                x,
+                cu_seqlens,
+                layer=layer,
+                max_seqlen=max_seqlen,
+                is_causal=causal_mask,
+                attention_policies=attention_policies,
+            )
         x = self.final_norm(x)
         return x, output_lengths

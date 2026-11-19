@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.activation_policy import CheckpointStrategy, install_activation_strategies
 from megatron.core.transformer.moe.router_replay import (
     ChunkedRouterReplay,
     RouterReplay,
@@ -49,43 +50,47 @@ class ToyMoE(torch.nn.Module):
     """Per-token MoE stand-in: output = x * (sum of the selected experts' probs), masked to 0.
 
     Like ``MoELayer``, it replays ``replay_topk_idx`` around its router call and, with
-    ``moe_layer_recompute``, checkpoints that call (``calls`` then also logs the recompute).
+    ``moe_layer_recompute``, checkpoints that call (point ``_moe_forward``; ``calls`` then also
+    logs the recompute).
     """
 
     def __init__(self, moe_layer_recompute=False):
         super().__init__()
         self.router = ToyRouter()
-        self.moe_layer_recompute = moe_layer_recompute
         self.calls = []
+        self.moe_layer_recompute = moe_layer_recompute
+        strategies = [
+            CheckpointStrategy(self._moe_forward, impl="non_reentrant", training_only=True)
+        ]
+        install_activation_strategies(self, strategies if moe_layer_recompute else [])
 
     def forward(
         self, x, padding_mask=None, packed_seq_params=None, input_ids=None, replay_topk_idx=None
     ):
-        def custom_forward(x):
-            with RouterReplay.replay_indices_for_call(self.router.router_replay, replay_topk_idx):
-                probs, indices = self.router(x)
-            self.calls.append(
-                {
-                    "tokens": x.shape[0],
-                    "x": x.detach().clone(),
-                    "padding_mask": padding_mask,
-                    "indices": indices.clone(),
-                }
-            )
-            out = x * probs.sum(dim=-1).reshape(x.shape[0], x.shape[1], 1)
-            if padding_mask is not None:  # [b, s], True = padding
-                out = out * (~padding_mask).transpose(0, 1).unsqueeze(-1)
-            return out
+        return self._moe_forward(x, padding_mask, replay_topk_idx), None
 
-        if self.moe_layer_recompute and self.training:
-            out = torch.utils.checkpoint.checkpoint(custom_forward, x, use_reentrant=True)
-        else:
-            out = custom_forward(x)
-        return out, None
+    def _moe_forward(self, x, padding_mask=None, replay_topk_idx=None):
+        with RouterReplay.replay_indices_for_call(self.router.router_replay, replay_topk_idx):
+            probs, indices = self.router(x)
+        self.calls.append(
+            {
+                "tokens": x.shape[0],
+                "x": x.detach().clone(),
+                "padding_mask": padding_mask,
+                "indices": indices.clone(),
+            }
+        )
+        out = x * probs.sum(dim=-1).reshape(x.shape[0], x.shape[1], 1)
+        if padding_mask is not None:  # [b, s], True = padding
+            out = out * (~padding_mask).transpose(0, 1).unsqueeze(-1)
+        return out
 
 
 def _run_in_chunks(mlp, x, padding_mask, num_chunks, is_moe_layer=True, input_ids=None):
-    layer = SimpleNamespace(is_moe_layer=is_moe_layer, mlp=mlp)
+    # Like MoELayer, the toy MoE reruns each call in backward iff it checkpoints it.
+    recompute = getattr(mlp, "moe_layer_recompute", False)
+    config = SimpleNamespace(moe_calls_rerun_in_backward=lambda: recompute)
+    layer = SimpleNamespace(is_moe_layer=is_moe_layer, mlp=mlp, config=config)
     return TransformerLayer._run_mlp_in_chunks(layer, x, padding_mask, input_ids, None, num_chunks)
 
 

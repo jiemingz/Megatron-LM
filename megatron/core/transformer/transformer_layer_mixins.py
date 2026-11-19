@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import logging
 from functools import partial
 from inspect import signature
 from typing import Optional
@@ -17,9 +16,7 @@ from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.typed_torch import apply_module
-from megatron.core.utils import is_te_min_version, is_torch_min_version, log_single_rank
-
-logger = logging.getLogger(__name__)
+from megatron.core.utils import is_te_min_version
 
 
 class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
@@ -35,106 +32,9 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
         # set in get_layer_static_inputs at capture, None when the graph has no such input.
         self._te_cuda_graph_padding_mask_shape: Optional[tuple[int, ...]] = None
 
-        # Check the compatibility of fine-grained activation offloading and cuda graph.
-        if self.config.fine_grained_activation_offloading:
-            cuda_graph_modules = self.config.cuda_graph_modules or []
-            if CudaGraphModule.attn in cuda_graph_modules:
-                self.offload_attn_norm = False
-                log_single_rank(
-                    logger,
-                    logging.WARNING,
-                    "attn_norm offloading is not supported with attn cudagraph. "
-                    "Disabling attn_norm offloading.",
-                )
-            mark_mlp_norm_offloading_not_supported = False
-            # For moe layer, mlp_norm offloading isn't supported with attn or moe_router cudagraph.
-            if self.is_moe_layer:
-                if (
-                    CudaGraphModule.attn in cuda_graph_modules
-                    or CudaGraphModule.moe_router in cuda_graph_modules
-                ):
-                    mark_mlp_norm_offloading_not_supported = True
-            # For non-moe layer, mlp_norm is the boundary of attn or mlp cudagraph.
-            # The only case where mlp_norm offloading is supported is when whole layer is captured.
-            elif (
-                CudaGraphModule.attn in cuda_graph_modules
-                and CudaGraphModule.mlp not in cuda_graph_modules
-            ) or (
-                CudaGraphModule.attn not in cuda_graph_modules
-                and CudaGraphModule.mlp in cuda_graph_modules
-            ):
-                mark_mlp_norm_offloading_not_supported = True
-            if mark_mlp_norm_offloading_not_supported:
-                self.offload_mlp_norm = False
-                log_single_rank(
-                    logger,
-                    logging.WARNING,
-                    "mlp_norm offloading is not supported with the current cudagraph scope. "
-                    "Disabling mlp_norm offloading.",
-                )
-        # Set the offload module in cuda graph flag.
-        self.offload_module_in_cuda_graph = False
-        cuda_graph_modules = self.config.cuda_graph_modules or []
-        if CudaGraphModule.attn in cuda_graph_modules:
-            if self.offload_core_attn or self.offload_attn_proj or self.offload_qkv_linear:
-                self.offload_module_in_cuda_graph = True
-        if not self.is_moe_layer and CudaGraphModule.mlp in cuda_graph_modules:
-            if self.offload_mlp_norm:
-                self.offload_module_in_cuda_graph = True
-        if self.offload_module_in_cuda_graph:
-            assert is_torch_min_version(
-                "2.9.0a0"
-            ), "Offloading modules captured in cuda graph requires torch>=2.9.0."
-            assert is_te_min_version(
-                "2.14.0"
-            ), "Offloading modules captured in cuda graph requires TE>=2.14.0."
-            assert (
-                self.config.cuda_graph_warmup_steps > 0
-            ), "Fine-grained activation offloading needs cuda_graph_warmup_steps > 0."
+        # Offload/recompute compatibility with the graph scope is validated by TransformerConfig;
+        # offload_module_in_cuda_graph is set by TransformerLayer.
         return self
-
-    @staticmethod
-    def can_recompute_pre_mlp_layernorm_for_te_cudagraph(config, is_moe_layer):
-        """Check whether a TE MoE router graph permits pre-MLP layernorm recomputation."""
-        if (
-            config.cuda_graph_impl != "transformer_engine"
-            or not is_moe_layer
-            or CudaGraphModule.moe_router not in config.cuda_graph_modules
-        ):
-            # TE router capture does not constrain this layernorm.
-            return True
-        if (
-            config.moe_shared_expert_intermediate_size is not None
-            and config.moe_shared_expert_overlap
-        ):
-            # If shared expert overlap is used, we cannot make the pre-mlp layernorm
-            # recomputation, because the shared expert takes the layernorm output as
-            # input, and it is outside of the CUDA graph scope.
-            log_single_rank(
-                logger,
-                logging.WARNING,
-                "pre_mlp_layernorm recompute is not supported with moe router "
-                "cudagraph + shared expert overlap. Disabling pre_mlp_layernorm "
-                "recompute.",
-            )
-            return False
-        if CudaGraphModule.moe_preprocess in config.cuda_graph_modules and (
-            config.moe_token_dispatcher_type == "alltoall" or config.moe_latent_size
-        ):
-            # Only when capturing the preprocess part and using alltoall token
-            # dispatcher or latent MoE can we make the pre-mlp layernorm recomputation.
-            # Because in other cases the layernorm output returns directly as one of the
-            # outputs of the cudagraph, which will be allocated a static buffer, thus
-            # not able to be released.
-            return True
-        log_single_rank(
-            logger,
-            logging.WARNING,
-            "pre_mlp_layernorm recompute is only supported with moe router + "
-            "preprocess cudagraph will alltoall token dispatcher or latent MoE. "
-            "Disabling pre_mlp_layernorm recompute.",
-        )
-        return False
 
     def _forward_attention(self, *args, **kwargs):
         """Observe the whole-layer mask for both normal and EP-overlap warmup calls."""
@@ -349,13 +249,10 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
             and is_graph_capturing()
             and CudaGraphModule.moe_router in self.config.cuda_graph_modules
         ):
-            if self.recompute_pre_mlp_layernorm:
-                # Register the recompute hooks to all the cudagraph output tensors, because some
-                # tensors are in parallel execution paths and they all need pre_mlp_layernorm to be
-                # recomputed in backward pass. For example, the router path and the shared expert
-                # path. So only register in one path is risky.
-                for tensor in mlp_output_with_bias:
-                    self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(tensor)
+            # The graph ends before the MLP BDA. A recomputed pre_mlp_layernorm must be rebuilt
+            # before any of the graph outputs is consumed in backward (the router path and the
+            # shared expert path run in parallel), so release it on every output.
+            self.fire_activation_boundary(self._mlp_bda, "enter", list(mlp_output_with_bias))
             return list(mlp_output_with_bias) + [residual]
 
         return None
@@ -559,12 +456,9 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
             if self.config.overlap_moe_expert_parallel_comm:
                 return (residual, *mlp_output_with_bias)
 
-            # If we early returned, layernorm recompute hooks were attached to the output buffer
-            # of the cudagraph, so disable the recompute hooks inside _apply_mlp_bda_step
-            recompute_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm
-            self.recompute_pre_mlp_layernorm = False
+            # Layernorm recompute hooks were attached to the graph outputs at capture; the
+            # replayed graph registers no new release, so the BDA below finds none pending.
             output = self._apply_mlp_bda_step(mlp_output_with_bias, residual)
-            self.recompute_pre_mlp_layernorm = recompute_pre_mlp_layernorm
         else:
             # If EP overlap is enabled, needs to return same outputs as submodule.attn
             if self.config.overlap_moe_expert_parallel_comm:

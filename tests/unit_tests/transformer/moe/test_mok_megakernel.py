@@ -15,6 +15,8 @@ from megatron.core.transformer.moe.megakernel.mok import weights as mok_weights
 
 @pytest.mark.parametrize("recompute", [False, True])
 def test_megakernel_forward_preserves_packed_routing_metadata(monkeypatch, recompute):
+    from megatron.core.activation_policy import CheckpointStrategy, install_activation_strategies
+    from megatron.core.activation_policy import strategies as activation_strategies
     from megatron.core.packed_seq_params import PackedSeqParams
     from megatron.core.transformer.moe import moe_layer
 
@@ -22,8 +24,10 @@ def test_megakernel_forward_preserves_packed_routing_metadata(monkeypatch, recom
     torch.nn.Module.__init__(layer)
     layer.config = SimpleNamespace(moe_megakernel_backend="mok", sequence_parallel=False)
     layer.attn_tp_group = SimpleNamespace(size=lambda: 1)
-    layer.tp_group = object()
-    layer.moe_layer_recompute = recompute
+    layer.training = True
+    layer.pg_collection = SimpleNamespace(tp=object())
+    if recompute:
+        install_activation_strategies(layer, [CheckpointStrategy(layer._megakernel_forward)])
     hidden = torch.ones(4, 1, 8)
     padding_mask = torch.zeros(1, 4, dtype=torch.bool)
     input_ids = torch.arange(4).view(1, 4)
@@ -34,8 +38,8 @@ def test_megakernel_forward_preserves_packed_routing_metadata(monkeypatch, recom
     layer.route = Mock(return_value=(probs, routes))
     layer.megakernel_experts = torch.nn.Identity()
     layer.megakernel_experts.forward = Mock(return_value=hidden)
-    checkpoint = Mock(side_effect=lambda fn, config, group, *args: fn(*args))
-    monkeypatch.setattr(moe_layer, "precision_aware_checkpoint", checkpoint)
+    checkpoint = Mock(side_effect=lambda fn, config, group, *args, **kwargs: fn(*args))
+    monkeypatch.setattr(activation_strategies, "precision_aware_checkpoint", checkpoint)
 
     output, bias = layer(
         hidden,

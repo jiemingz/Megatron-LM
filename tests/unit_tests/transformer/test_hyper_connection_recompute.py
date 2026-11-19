@@ -4,7 +4,7 @@
 Unit tests for HyperConnection block-level recomputation.
 
 Tests the following functionality:
-1. HyperConnectionModule._forward_with_checkpoint correctness
+1. HyperConnectionModule replay (mHC recompute scope) correctness
 2. HyperConnectionModule.apply_h_post with CheckpointWithoutOutputManager
 3. Multiple HyperConnectionModules chained with a single CheckpointWithoutOutputManager
 4. Partial checkpoint (last layer not checkpointed)
@@ -13,14 +13,55 @@ Tests the following functionality:
 
 import pytest
 import torch
+from torch import nn
 
-from megatron.core.tensor_parallel.random import (
-    CheckpointWithoutOutputManager,
-    model_parallel_cuda_manual_seed,
+from megatron.core.activation_policy import (
+    ReplayRegion,
+    ResidualBranch,
+    ResidualReplayStrategy,
+    install_activation_strategies,
 )
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+
+
+class _Replay:
+    """Replay the modules' ``aggregate`` and ``_expand_h_post`` points in one mHC recompute block, as
+    the layer stack does; the test finalizes the block on a tensor of its choice."""
+
+    class _Layer:
+        def __init__(self, module):
+            self.module = module
+
+        def get_residual_branches_by_layer(self):
+            module = self.module
+            return [
+                [
+                    ResidualBranch(
+                        read=ReplayRegion(module, module.aggregate),
+                        ops=(ReplayRegion(module, module._expand_h_post),),
+                        write=ReplayRegion(module, module._h_res_h_post_bda),  # not called here
+                    )
+                ]
+            ]
+
+    class _Stack(nn.Module):
+        def _run_layer(self, index, *args):  # the tests call the modules themselves
+            raise AssertionError("not used")
+
+    def __init__(self, *modules):
+        self.holder = self._Stack()
+        self.strategy = ResidualReplayStrategy(
+            self.holder._run_layer, [self._Layer(module) for module in modules], block_size=None
+        )
+        install_activation_strategies(self.holder, [self.strategy])
+
+    def finalize(self, hook_tensor):
+        """Release the block's recorded outputs; they are rebuilt from ``hook_tensor``'s grad."""
+        manager = self.strategy.release(0)
+        manager.discard_all_outputs_and_register_unified_recompute(hook_tensor)
 
 
 class TestHyperConnectionModuleCheckpoint:
@@ -77,7 +118,7 @@ class TestHyperConnectionModuleCheckpoint:
 
     def test_forward_normal_vs_checkpoint_correctness(self):
         """
-        Test that _forward_with_checkpoint produces the same outputs as _forward_normal.
+        Test that forward inside an mHC replay scope produces the same outputs as without.
         """
         hidden_size = 64
         num_streams = 4
@@ -101,7 +142,9 @@ class TestHyperConnectionModuleCheckpoint:
         # Forward without checkpoint (reference)
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        aggregated_ref, h_res_ref, h_post_ref, residual_ref = module._forward_normal(hidden_states)
+        aggregated_ref, h_res_ref, h_post_ref, residual_ref = module(
+            hidden_states, return_residual=True
+        )
         mixed_ref = module.apply_h_res(h_res_ref, residual)
         loss_ref = aggregated_ref.sum() + mixed_ref.sum() + h_post_ref.sum()
         loss_ref.backward()
@@ -111,16 +154,16 @@ class TestHyperConnectionModuleCheckpoint:
         # Forward with checkpoint
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        manager = CheckpointWithoutOutputManager()
-        aggregated_ckpt, h_res_ckpt, h_post_ckpt, residual_ckpt_out = (
-            module._forward_with_checkpoint(hidden_states_ckpt, manager)
+        replay = _Replay(module)
+        aggregated_ckpt, h_res_ckpt, h_post_ckpt, residual_ckpt_out = module(
+            hidden_states_ckpt, return_residual=True
         )
         mixed_ckpt = module.apply_h_res(h_res_ckpt, residual_ckpt)
         # Calculate loss before discarding outputs
         loss_ckpt = aggregated_ckpt.sum() + mixed_ckpt.sum() + h_post_ckpt.sum()
 
         # Register unified recompute hook
-        manager.discard_all_outputs_and_register_unified_recompute(loss_ckpt)
+        replay.finalize(loss_ckpt)
 
         # Backward pass
         loss_ckpt.backward()
@@ -161,7 +204,7 @@ class TestHyperConnectionModuleCheckpoint:
 
         # Reference: without checkpoint (manager=None)
         torch.manual_seed(42)
-        x_out_ref, bias_out_ref = module.apply_h_post((x, bias), h_post, manager=None)
+        x_out_ref, bias_out_ref = module.apply_h_post((x, bias), h_post)
         loss_ref = x_out_ref.sum()
         if bias_out_ref is not None:
             loss_ref = loss_ref + bias_out_ref.sum()
@@ -171,15 +214,13 @@ class TestHyperConnectionModuleCheckpoint:
 
         # With checkpoint (manager provided)
         torch.manual_seed(42)
-        manager = CheckpointWithoutOutputManager()
-        x_out_ckpt, bias_out_ckpt = module.apply_h_post(
-            (x_ckpt, bias), h_post_ckpt, manager=manager
-        )
+        replay = _Replay(module)
+        x_out_ckpt, bias_out_ckpt = module.apply_h_post((x_ckpt, bias), h_post_ckpt)
         loss_ckpt = x_out_ckpt.sum()
         if bias_out_ckpt is not None:
             loss_ckpt = loss_ckpt + bias_out_ckpt.sum()
 
-        manager.discard_all_outputs_and_register_unified_recompute(loss_ckpt)
+        replay.finalize(loss_ckpt)
         loss_ckpt.backward()
         grad_x_ckpt = x_ckpt.grad.clone()
         grad_h_post_ckpt = h_post_ckpt.grad.clone()
@@ -190,7 +231,7 @@ class TestHyperConnectionModuleCheckpoint:
 
     def test_forward_with_manager_parameter(self):
         """
-        Test forward() method with mhc_recompute_manager parameter.
+        Test forward() with the mHC regions replayed with their block.
         """
         hidden_size = 64
         num_streams = 4
@@ -207,26 +248,22 @@ class TestHyperConnectionModuleCheckpoint:
         # Clone inputs
         hidden_states_ckpt = hidden_states.detach().clone().requires_grad_(True)
 
-        # Reference: forward without manager (uses _forward_normal)
+        # Reference: forward outside any replay scope
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        aggregated_ref, h_res_ref, h_post_ref = module.forward(
-            hidden_states, mhc_recompute_manager=None
-        )
+        aggregated_ref, h_res_ref, h_post_ref = module.forward(hidden_states)
         loss_ref = aggregated_ref.sum() + h_res_ref.sum() + h_post_ref.sum()
         loss_ref.backward()
         grad_hidden_ref = hidden_states.grad.clone()
 
-        # With manager (uses _forward_with_checkpoint)
+        # With the mHC regions replayed (recorded into the block's manager)
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        manager = CheckpointWithoutOutputManager()
-        aggregated_ckpt, h_res_ckpt, h_post_ckpt = module.forward(
-            hidden_states_ckpt, mhc_recompute_manager=manager
-        )
+        replay = _Replay(module)
+        aggregated_ckpt, h_res_ckpt, h_post_ckpt = module.forward(hidden_states_ckpt)
         loss_ckpt = aggregated_ckpt.sum() + h_res_ckpt.sum() + h_post_ckpt.sum()
 
-        manager.discard_all_outputs_and_register_unified_recompute(loss_ckpt)
+        replay.finalize(loss_ckpt)
         loss_ckpt.backward()
         grad_hidden_ckpt = hidden_states_ckpt.grad.clone()
 
@@ -289,8 +326,8 @@ class TestMHCBlockRecomputeIntegration:
         h = hidden_states_ref
         r = residual_ref
         for module in modules:
-            agg, h_res, h_post = module.forward(h, mhc_recompute_manager=None)
-            agg, _ = module.apply_h_post((0.1 * agg, None), h_post, manager=None)
+            agg, h_res, h_post = module.forward(h)
+            agg, _ = module.apply_h_post((0.1 * agg, None), h_post)
             mixed = module.apply_h_res(h_res, r)  # Apply h_res to get mixed [s, b, n*C]
             h = agg + mixed
             r = h
@@ -304,19 +341,19 @@ class TestMHCBlockRecomputeIntegration:
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
 
-        manager = CheckpointWithoutOutputManager()
+        replay = _Replay(*modules)
 
         h = hidden_states_ckpt
         r = residual_ckpt
         for module in modules:
-            agg, h_res, h_post = module.forward(h, mhc_recompute_manager=manager)
-            agg, _ = module.apply_h_post((0.1 * agg, None), h_post, manager=manager)
+            agg, h_res, h_post = module.forward(h)
+            agg, _ = module.apply_h_post((0.1 * agg, None), h_post)
             mixed = module.apply_h_res(h_res, r)  # Apply h_res to get mixed [s, b, n*C]
             h = agg + mixed
             r = h
 
         loss_ckpt = h.sum()
-        manager.discard_all_outputs_and_register_unified_recompute(loss_ckpt)
+        replay.finalize(loss_ckpt)
         loss_ckpt.backward()
 
         grad_hidden_ckpt = hidden_states_ckpt.grad.clone()
@@ -367,12 +404,8 @@ class TestMHCBlockRecomputeIntegration:
         # Reference
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        aggregated_ref, h_res_ref, h_post_ref = module.forward(
-            hidden_states_ref, mhc_recompute_manager=None
-        )
-        aggregated_ref, _ = module.apply_h_post(
-            (0.1 * aggregated_ref, None), h_post_ref, manager=None
-        )
+        aggregated_ref, h_res_ref, h_post_ref = module.forward(hidden_states_ref)
+        aggregated_ref, _ = module.apply_h_post((0.1 * aggregated_ref, None), h_post_ref)
         mixed_ref = module.apply_h_res(
             h_res_ref, residual_ref
         )  # Apply h_res to get mixed [s, b, n*C]
@@ -385,14 +418,10 @@ class TestMHCBlockRecomputeIntegration:
         # With manager - checkpoint everything except final output
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        manager = CheckpointWithoutOutputManager()
-        aggregated_ckpt, h_res_ckpt, h_post_ckpt = module.forward(
-            hidden_states_ckpt, mhc_recompute_manager=manager
-        )
+        replay = _Replay(module)
+        aggregated_ckpt, h_res_ckpt, h_post_ckpt = module.forward(hidden_states_ckpt)
 
-        aggregated_ckpt, _ = module.apply_h_post(
-            (0.1 * aggregated_ckpt, None), h_post_ckpt, manager=manager
-        )
+        aggregated_ckpt, _ = module.apply_h_post((0.1 * aggregated_ckpt, None), h_post_ckpt)
         mixed_ckpt = module.apply_h_res(
             h_res_ckpt, residual_ckpt
         )  # Apply h_res to get mixed [s, b, n*C]
@@ -400,7 +429,7 @@ class TestMHCBlockRecomputeIntegration:
         output_ckpt = aggregated_ckpt + 0.5 * mixed_ckpt
 
         # Register unified recompute on the output (which is not checkpointed)
-        manager.discard_all_outputs_and_register_unified_recompute(output_ckpt)
+        replay.finalize(output_ckpt)
 
         loss_ckpt = output_ckpt.sum()
         loss_ckpt.backward()

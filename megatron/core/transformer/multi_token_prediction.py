@@ -13,6 +13,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
+from megatron.core.activation_policy import CheckpointStrategy
 from megatron.core.context_parallel import ContextParallelBatch, convert_cp_layout
 from megatron.core.context_parallel.sequence_roll import roll_contiguous, roll_contiguous_fields
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
@@ -46,7 +47,6 @@ from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import precision_aware_checkpoint
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import (
     get_pg_rank,
@@ -1842,7 +1842,31 @@ class MultiTokenPredictionLayer(MegatronModule):
                     setattr(self.hc_head_fn, "sequence_parallel", True)
                     setattr(self.hc_head_base, "sequence_parallel", True)
                     setattr(self.hc_head_scale, "sequence_parallel", True)
-        self.offload_context = nullcontext()
+        # Activation strategies: under full recompute, legacy GPT MTP checkpoints its projection
+        # + transformer layer (point _proj_and_transformer_layer); hybrid MTP delegates full
+        # recompute to its nested HybridStack instead.
+        config = self.config
+        activation_strategies = []
+        if config.recompute_granularity == "full" and not self.is_hybrid_mtp:
+            if config.recompute_method == "block":
+                # TODO: implement block-based recompute for MTP.
+                warnings.warn(
+                    "recompute_method == 'block' is not supported for MTP yet. Skipping recompute."
+                )
+            else:
+                assert (
+                    config.recompute_num_layers == 1
+                ), "recompute_num_layers must be 1 for MTP recompute"
+                activation_strategies.append(
+                    CheckpointStrategy(
+                        self._proj_and_transformer_layer,
+                        training_only=True,
+                        distribute_saved_activations=bool(config.distribute_saved_activations),
+                        # MTP runs after the decoder's delayed-FP8 context has closed.
+                        delayed_fp8_context=True,
+                    )
+                )
+        self.install_activation_strategies(activation_strategies)
 
     def get_inner_quantization_context(self) -> AbstractContextManager:
         """Return the quantization context for fine-grained MTP execution."""
@@ -2225,148 +2249,6 @@ class MultiTokenPredictionLayer(MegatronModule):
         )
         return hidden_states
 
-    def _checkpointed_forward(
-        self,
-        hidden_states: Tensor,
-        decoder_input: Tensor,
-        attention_mask: Optional[Tensor] = None,
-        padding_mask: Optional[Tensor] = None,
-        context: Optional[Tensor] = None,
-        context_mask: Optional[Tensor] = None,
-        rotary_pos_emb: Optional[Tensor] = None,
-        rotary_pos_cos: Optional[Tensor] = None,
-        rotary_pos_sin: Optional[Tensor] = None,
-        attention_bias: Optional[Tensor] = None,
-        inference_params: Optional[InferenceParams] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
-        sequence_len_offset: Optional[Tensor] = None,
-        packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
-        cp_layout_plan: Optional[THDCPLayoutPlan] = None,
-    ):
-        """Forward a legacy GPT MTP layer with activation recomputation.
-
-        Mirrors ``transformer_block._checkpointed_forward``:
-
-        * Non-tensor objects are captured by the ``custom_forward`` closure; only tensor / ``None``
-          arguments flow positionally through the underlying checkpoint primitive.
-        * Quantized recipes (fp8, fp4) route through ``te_checkpoint``;
-          everything else uses ``tensor_parallel.checkpoint``.
-        * Only ``fp8 + delayed scaling`` needs an outer quantization
-          context entered before ``te_checkpoint``; see the
-          ``outer_quantization_context`` block below.
-        """
-
-        assert (
-            not self.is_hybrid_mtp
-        ), "Hybrid MTP delegates full activation recomputation to its nested HybridStack."
-
-        def custom_forward(
-            hidden_states,
-            decoder_input,
-            attention_mask,
-            padding_mask,
-            context,
-            context_mask,
-            rotary_pos_emb,
-            rotary_pos_cos,
-            rotary_pos_sin,
-            sequence_len_offset,
-        ):
-            return self._proj_and_transformer_layer(
-                hidden_states=hidden_states,
-                decoder_input=decoder_input,
-                attention_mask=attention_mask,
-                padding_mask=padding_mask,
-                context=context,
-                context_mask=context_mask,
-                rotary_pos_emb=rotary_pos_emb,
-                rotary_pos_cos=rotary_pos_cos,
-                rotary_pos_sin=rotary_pos_sin,
-                attention_bias=attention_bias,
-                inference_params=inference_params,
-                packed_seq_params=packed_seq_params,
-                sequence_len_offset=sequence_len_offset,
-                packed_seq_params_by_layout=packed_seq_params_by_layout,
-                cp_layout_plan=cp_layout_plan,
-            )
-
-        # Decide the outer quantization context, matching
-        # ``transformer_block._checkpointed_forward``. Only ``fp8 + delayed
-        # scaling`` needs an active context at the ``te_checkpoint`` entry
-        # point: TE's ``_CheckpointFunction.forward`` samples
-        # ``FP8GlobalStateManager.is_fp8_enabled()`` there to gate the
-        # phase-1 amax-buffer stash that phase-2 backward looks up via
-        # ``global_fp8_buffer_pos_fwd_recompute``. With fp8 only entered
-        # *inside* ``_proj_and_transformer_layer``, TE samples fp8 as off,
-        # phase-1 skips the stash, and phase-2 raises ``KeyError``.
-        # Non-delayed fp8 recipes (MXFP8BlockScaling, Float8CurrentScaling)
-        # and fp4 (NVFP4BlockScaling) treat the stash/lookup as a noop, so
-        # the inner context entered inside ``_proj_and_transformer_layer``
-        # is sufficient.
-        if self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed:
-            outer_quantization_context = get_fp8_context(self.config)
-        else:
-            outer_quantization_context = nullcontext()
-
-        def checkpoint_handler():
-            """Checkpoint ``custom_forward`` with the implementation its precision requires."""
-            # tensor_parallel.checkpoint stashes args via autograd's
-            # ``save_for_backward``, which only accepts tensors and ``None``.
-            # Pass tensor / ``None`` args positionally and capture the
-            # non-tensor objects via the ``custom_forward`` closure.
-            return precision_aware_checkpoint(
-                custom_forward,
-                self.config,
-                self.tp_group,
-                hidden_states,
-                decoder_input,
-                attention_mask,
-                padding_mask,
-                context,
-                context_mask,
-                rotary_pos_emb,
-                rotary_pos_cos,
-                rotary_pos_sin,
-                sequence_len_offset,
-                distribute_saved_activations=self.config.distribute_saved_activations,
-            )
-
-        if self.config.recompute_method == 'uniform':
-            # Uniformly divide the total number of Transformer layers and checkpoint
-            # the input activation of each divided chunk.
-            # A method to further reduce memory usage reducing checkpoints.
-            assert (
-                self.config.recompute_num_layers == 1
-            ), "recompute_num_layers must be 1 for MTP recompute"
-            with outer_quantization_context:
-                outputs = checkpoint_handler()
-        elif self.config.recompute_method == 'block':
-            # TODO: implement block-based recompute for MTP
-            warnings.warn(
-                "recompute_method == 'block' is not supported for MTP yet." " Skipping recompute."
-            )
-            outputs = self._proj_and_transformer_layer(
-                hidden_states=hidden_states,
-                decoder_input=decoder_input,
-                attention_mask=attention_mask,
-                padding_mask=padding_mask,
-                context=context,
-                context_mask=context_mask,
-                rotary_pos_emb=rotary_pos_emb,
-                rotary_pos_cos=rotary_pos_cos,
-                rotary_pos_sin=rotary_pos_sin,
-                attention_bias=attention_bias,
-                inference_params=inference_params,
-                packed_seq_params=packed_seq_params,
-                sequence_len_offset=sequence_len_offset,
-                packed_seq_params_by_layout=packed_seq_params_by_layout,
-                cp_layout_plan=cp_layout_plan,
-            )
-        else:
-            raise ValueError("Invalid activation recompute method.")
-
-        return outputs
-
     def forward(
         self,
         input_ids: Optional[Tensor],
@@ -2436,48 +2318,25 @@ class MultiTokenPredictionLayer(MegatronModule):
                 decoder_input=decoder_input, hidden_states=hidden_states
             )
 
-        # Legacy GPT MTP owns one outer checkpoint around its projection and Transformer
-        # layer. Hybrid MTP instead delegates full recompute to the nested HybridStack so
-        # that ``recompute_num_layers`` controls its layer chunks without nesting checkpoints.
-        use_outer_recompute = (
-            self.config.recompute_granularity == 'full' and self.training and not self.is_hybrid_mtp
+        # The projection + transformer layer is one point; with full recompute, legacy GPT MTP
+        # checkpoints it as a whole (hybrid MTP recomputes inside its nested HybridStack).
+        hidden_states = self._proj_and_transformer_layer(
+            hidden_states=hidden_states,
+            decoder_input=decoder_input,
+            attention_mask=attention_mask,
+            padding_mask=padding_mask,
+            context=context,
+            context_mask=context_mask,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            attention_bias=attention_bias,
+            inference_params=inference_params,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            packed_seq_params_by_layout=packed_seq_params_by_layout,
+            cp_layout_plan=cp_layout_plan,
         )
-        if use_outer_recompute:
-            hidden_states = self._checkpointed_forward(
-                hidden_states=hidden_states,
-                decoder_input=decoder_input,
-                attention_mask=attention_mask,
-                padding_mask=padding_mask,
-                context=context,
-                context_mask=context_mask,
-                rotary_pos_emb=rotary_pos_emb,
-                rotary_pos_cos=rotary_pos_cos,
-                rotary_pos_sin=rotary_pos_sin,
-                attention_bias=attention_bias,
-                inference_params=inference_params,
-                packed_seq_params=packed_seq_params,
-                sequence_len_offset=sequence_len_offset,
-                packed_seq_params_by_layout=packed_seq_params_by_layout,
-                cp_layout_plan=cp_layout_plan,
-            )
-        else:
-            hidden_states = self._proj_and_transformer_layer(
-                hidden_states=hidden_states,
-                decoder_input=decoder_input,
-                attention_mask=attention_mask,
-                padding_mask=padding_mask,
-                context=context,
-                context_mask=context_mask,
-                rotary_pos_emb=rotary_pos_emb,
-                rotary_pos_cos=rotary_pos_cos,
-                rotary_pos_sin=rotary_pos_sin,
-                attention_bias=attention_bias,
-                inference_params=inference_params,
-                packed_seq_params=packed_seq_params,
-                sequence_len_offset=sequence_len_offset,
-                packed_seq_params_by_layout=packed_seq_params_by_layout,
-                cp_layout_plan=cp_layout_plan,
-            )
 
         return hidden_states, input_ids, position_ids, padding_mask, mtp_input_mask
 

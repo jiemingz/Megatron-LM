@@ -296,15 +296,14 @@ class TestNemoArchiveReaders:
         assert captured["window_size"] == (4, 0)
 
     def test_recompute_audio_checkpoints_transformer_layers(self, monkeypatch):
-        from megatron.core.models.audio import nemo_transformer_encoder
-
         calls = []
 
         def fake_checkpoint(function, *args, **kwargs):
             calls.append(kwargs)
             return function(*args)
 
-        monkeypatch.setattr(nemo_transformer_encoder, "checkpoint", fake_checkpoint)
+        # The activation-policy runtime runs the per-layer checkpoint.
+        monkeypatch.setattr("torch.utils.checkpoint.checkpoint", fake_checkpoint)
         cfg = NemoTransformerAudioConfig(
             **{**_MIN_CFG.__dict__, "attn_impl": "sdpa", "n_layers": 2, "recompute_layers": True}
         )

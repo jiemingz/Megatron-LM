@@ -30,11 +30,10 @@ for name in first:
 
 connection = importlib.import_module(prefix + "residual_connection")
 recompute = importlib.import_module(prefix + "residual_recompute")
-for method in (
-    connection.ResidualConnection._checkpoint_read,
-    connection.ResidualConnection._checkpoint_write,
-):
-    assert typing.get_type_hints(method)["context"] is recompute.ResidualStreamRecomputeContext
+for method in (connection.ResidualConnection._read, connection.ResidualConnection._write):
+    # The annotations resolve in every import order (no replay context is passed any more).
+    assert "context" not in typing.get_type_hints(method)
+assert recompute.ResidualReplayStrategy.__module__.endswith("recompute.replay")
 
 package = importlib.import_module("megatron.core.transformer")
 for symbol, new_name in (

@@ -1453,10 +1453,8 @@ class CompressedSparseAttention(MegatronModule):
         indexer = self.indexer
         indexer_loss_coeff = self.config.dsa_indexer_loss_coeff or 0.0
         training_with_grad = self.training and torch.is_grad_enabled()
-        reconstruct_kv_for_backward = (
-            torch.is_grad_enabled()
-            and self.config.recompute_granularity == "selective"
-            and "mla_up_proj" in (self.config.recompute_modules or [])
+        reconstruct_kv_for_backward = torch.is_grad_enabled() and self.config.recompute_selected(
+            "mla_up_proj"
         )
         sparse_indexer_loss = self.config.dsa_indexer_use_sparse_loss
         local_k_indexer_grad_edge = None

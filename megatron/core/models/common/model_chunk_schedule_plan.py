@@ -5,6 +5,8 @@ from typing import Any, Callable, List, Optional
 import torch
 from torch import Tensor
 
+from megatron.core.activation_policy.recompute.segments import RecomputeSegment
+from megatron.core.activation_policy.strategies import full_recompute_segments
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import reshard_fsdp_module
 from megatron.core.pipeline_parallel.utils import (
@@ -25,146 +27,6 @@ class ModelChunkState:
     """
 
     pass
-
-
-# ModelChunkState fields the layer forwards mutate in place; each segment snapshots them
-# so its backward-time replay sees the pre-segment values instead of end-of-chunk ones.
-#
-# ``mtp_input_mask`` belongs here for the same reason as ``input_ids``: MTP's
-# ``_get_embeddings`` rolls the two together (one concatenated roll, so CP does a single
-# boundary exchange) and writes both back to the chunk state. Leaving it out would let a
-# replay roll an already-rolled mask, shifting it one position against ``input_ids``, and
-# the mask drives ``torch.where(valid, decoder_input, decoder_input.detach())`` — so the
-# embedding rows detached would be the wrong ones and the MTP/embedding gradients would be
-# silently wrong rather than failing loudly.
-_MUTABLE_CHUNK_STATE_FIELDS = (
-    "input_ids",
-    "position_ids",
-    "padding_mask",
-    "mtp_input_mask",
-    "mtp_hidden_states",
-)
-
-
-def _copy_chunk_state_value(value: Any) -> Any:
-    """Copy list-valued chunk state so a later in-place append cannot corrupt a snapshot."""
-    return list(value) if isinstance(value, list) else value
-
-
-class RecomputeSegment:
-    """A contiguous group of layers recomputed as one unit.
-
-    The initial forward runs under ``no_grad`` and is replayed with grad enabled at the
-    start of the segment's own backward. A segment drops its layers' activations as soon
-    as its own forward is done (``release_activations``) and the replayed ones as each
-    node backwards (``ScheduleNode._release_state``), so only one segment's activations
-    are live at a time and what crosses the forward->backward gap is the segment's input
-    tensor plus the ``_MUTABLE_CHUNK_STATE_FIELDS`` snapshot. Layers left eager under
-    ``block`` keep their activations throughout. The A2A issued by a replay is exposed by
-    design; normal fwd/bwd A2A overlap is preserved.
-
-    ``start_index`` is the segment's first layer index within the chunk, for NVTX labels.
-    """
-
-    def __init__(
-        self,
-        layers: List["TransformerLayerSchedulePlan"],
-        chunk_state: ModelChunkState,
-        start_index: int,
-    ) -> None:
-        assert len(layers) > 0, "a recompute segment must contain at least one layer"
-        self.layers = layers
-        self.chunk_state = chunk_state
-        self.start_index = start_index
-        # Captured at the start of the segment's initial forward.
-        self.input_tensor = None
-        self.state_snapshot = None
-        self.rng_states = None
-        for layer in layers:
-            layer.recompute_segment = self
-            # The initial forward retains no autograd graph for these layers.
-            layer.set_forward_no_grad(True)
-
-    def capture(self, layer: "TransformerLayerSchedulePlan", f_input: Tensor) -> None:
-        """When the head layer starts its forward, snapshot what the replay needs:
-        input tensor, mutable chunk state, RNG."""
-        if layer is not self.layers[0]:
-            return
-        from megatron.core.tensor_parallel.random import _get_all_rng_states
-
-        self.input_tensor = f_input
-        cs = self.chunk_state
-        self.state_snapshot = {
-            name: _copy_chunk_state_value(getattr(cs, name)) for name in _MUTABLE_CHUNK_STATE_FIELDS
-        }
-        self.rng_states = _get_all_rng_states()
-
-    def release_activations(self, layer: "TransformerLayerSchedulePlan") -> None:
-        """Drop this segment's forward activations once its tail layer has forwarded.
-
-        Runs while the chunk forward is still going, not at the end of it: the nodes hold
-        their boundary tensors in ``inputs`` / ``output`` / ``detached`` until something
-        unsets them, so deferring this to the end of the chunk would keep one such set
-        alive per recomputed layer for the rest of the forward. The tail layer's output is
-        the caller's ``f_input`` and is what the next segment captures, so it survives.
-
-        Only the Python references are dropped. Resizing the storages (what
-        ``ScheduleNode``'s ``free_input`` path and ``tensor_parallel.random.checkpoint``
-        do) is not usable here: the replay rebuilds the graph on top of these very
-        tensors, and freeing their storage corrupts it.
-        """
-        if layer is not self.layers[-1]:
-            return
-        for seg_layer in self.layers:
-            seg_layer.reset_for_recompute()
-
-    def release_input(self, layer: "TransformerLayerSchedulePlan") -> None:
-        """Drop the retained input once the head layer has finished its backward."""
-        if layer is not self.layers[0]:
-            return
-        self.input_tensor = None
-        self.state_snapshot = None
-
-    def recompute(self, layer: "TransformerLayerSchedulePlan") -> None:
-        """Replay the segment with grad enabled when its tail layer enters the backward.
-
-        Must run before any of that layer's nodes backwards: ``mtp_post_process`` is in the
-        recompute scope, so its graph does not exist until the replay has run. Re-running
-        the same nodes in the same order repopulates each node's ``inputs`` / ``output`` /
-        ``detached`` / ``layer_state`` as in the initial forward.
-        """
-        if layer is not self.layers[-1]:
-            return
-        from megatron.core.tensor_parallel.random import _fork_rng, _set_all_rng_states
-
-        assert self.input_tensor is not None, (
-            "layer-level full recompute requires the retained segment input tensor, "
-            "but it is missing."
-        )
-        cs = self.chunk_state
-
-        for name, value in self.state_snapshot.items():
-            setattr(cs, name, _copy_chunk_state_value(value))
-
-        # The replayed nodes read inputs[i].grad to reach the previous segment, so the
-        # retained input has to be a grad-tracking leaf.
-        segment_input = self.input_tensor
-        if not segment_input.requires_grad:
-            segment_input.requires_grad_(True)
-
-        for seg_layer in self.layers:
-            seg_layer.set_forward_no_grad(False)
-
-        # Replay the forward RNG stream so rng-forked ops reproduce the initial forward.
-        with _fork_rng():
-            _set_all_rng_states(*self.rng_states)
-            f_input = segment_input
-            for i, seg_layer in enumerate(self.layers):
-                nvtx_msg = f"recompute_layer_{self.start_index + i}"
-                nvtx_range_push(nvtx_msg)
-                f_input = seg_layer.recompute_forward(f_input)
-                nvtx_range_pop(nvtx_msg)
-        self.rng_states = None
 
 
 class TransformerLayerSchedulePlan:
@@ -680,8 +542,9 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
     def _build_recompute_segments(self, config):
         """Split this chunk's layers into full-recompute segments.
 
-        Decoder segmentation mirrors megatron.core.recompute.checkpointed_forward, so
-        recompute_method / recompute_num_layers mean the same thing with and without
+        Decoder segments come from activation_policy.strategies.full_recompute_segments, the
+        same definition the decoder block's LayerWiseCheckpointStrategy uses, so recompute_method /
+        recompute_num_layers mean the same thing with and without
         --overlap-moe-expert-parallel-comm: 'uniform' groups every decoder layer by
         recompute_num_layers, 'block' recomputes the first recompute_num_layers decoder
         layers one per segment. MTP gets one segment per depth under both methods.
@@ -711,20 +574,17 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         decoder_layers = self._transformer_layers[: self._num_decoder_layers]
         mtp_layers = self._transformer_layers[self._num_decoder_layers :]
 
-        if method == "uniform":
-            for start in range(0, len(decoder_layers), num_layers):
-                add_segment(decoder_layers[start : start + num_layers], start)
-        else:
-            for start, layer in enumerate(decoder_layers[:num_layers]):
-                add_segment([layer], start)
+        for start, end in full_recompute_segments(method, num_layers, len(decoder_layers)):
+            add_segment(decoder_layers[start:end], start)
         # MTP is one segment per depth under both methods. TransformerConfig rejects full
         # recompute with mtp_num_layers > 1 under overlap_moe_expert_parallel_comm, so the
         # MTP side of the config is identical either way. A later depth's replay would read
         # the earlier depths' no-grad outputs from the chunk state and drop their loss
-        # gradients. MultiTokenPredictionLayer._checkpointed_forward leaves MTP eager
-        # under 'block' (its own TODO), which is safe there because the decoder block goes
-        # through tensor_parallel.checkpoint and keeps an autograd edge into MTP. This
-        # path's replay has no such edge, so an eager MTP would strand the hand-off.
+        # gradients. The MTP layer's activation strategies leave MTP eager under 'block' (its
+        # own TODO in MultiTokenPredictionLayer.activation_strategies), which is safe there
+        # because the decoder block goes through tensor_parallel.checkpoint and keeps an
+        # autograd edge into MTP. This path's replay has no such edge, so an eager MTP would
+        # strand the hand-off.
         for i, layer in enumerate(mtp_layers):
             add_segment([layer], self._num_decoder_layers + i)
 

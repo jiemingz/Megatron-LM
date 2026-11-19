@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 import megatron.core.extensions.transformer_engine as te_extension
 import megatron.core.transformer.moe.experts as experts_module
+from megatron.core.activation_policy import CheckpointWithoutOutputStrategy, Event
 from megatron.core.activations import squared_relu
 from megatron.core.extensions import transformer_engine as te_ext
 from megatron.core.fp8_utils import get_fp8_context
@@ -2825,7 +2826,7 @@ def _build_moe_act_recompute_module():
         use_te_activation_func=False,
         bias_activation_fusion=False,
         use_fused_weighted_squared_relu=False,
-        # Every activation_func_* field read by bias_act_func is defined here, including
+        # Every activation_func_* field read by _bias_activation is defined here, including
         # ones only reached on branches this stub does not take, so that a future edit to
         # a neighbouring branch fails on the assertion rather than on AttributeError.
         activation_func=F.gelu,
@@ -2835,6 +2836,14 @@ def _build_moe_act_recompute_module():
         activation_func_tanh_clamp_scale_linear=None,
         glu_linear_offset=0.0,
     )
+    # Built without __init__: install the moe_act recompute strategy TEGroupedMLP would.
+    module.install_activation_strategies(
+        [
+            CheckpointWithoutOutputStrategy(
+                module._bias_activation, release_on=Event(module.linear_fc2, "exit")
+            )
+        ]
+    )
     return module
 
 
@@ -2842,7 +2851,8 @@ def _run_moe_act_forward(monkeypatch):
     """Run TEGroupedMLP.forward with CheckpointWithoutOutput swapped for a spy."""
     _RecordingCheckpoint.instances = []
     monkeypatch.setattr(
-        experts_module.tensor_parallel, "CheckpointWithoutOutput", _RecordingCheckpoint
+        "megatron.core.activation_policy.recompute.checkpointing.CheckpointWithoutOutput",
+        _RecordingCheckpoint,
     )
     module = _build_moe_act_recompute_module()
     hidden_states = torch.ones(4, 8, requires_grad=True)

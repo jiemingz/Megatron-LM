@@ -206,20 +206,22 @@ def _run_wide_backward(
         requires_grad=True,
     )
     layers = list(ddp_model.module.children())
+    stack = None
     if residual_stream_recompute:
-        from megatron.core.transformer.residual_recompute import (
-            build_residual_stream_recompute_plan,
-        )
+        from megatron.core.activation_policy import install_activation_strategies
+        from tests.unit_tests.test_utilities import install_residual_replay
 
-        replay_contexts = build_residual_stream_recompute_plan(len(layers), len(layers))
-    else:
-        replay_contexts = [None] * len(layers)
+        # One replay block over all layers, as the layer stack would install it.
+        stack = install_residual_replay(layers, block_size=len(layers))
 
     out = x
-    for layer, replay_context in zip(layers, replay_contexts):
-        out, _ = layer(out, attention_mask=None, residual_stream_recompute_context=replay_context)
-        if replay_context is not None:
-            replay_context.finalize(out)
+    for index, layer in enumerate(layers):
+        if stack is not None:
+            out, _ = stack._run_layer(index, out, attention_mask=None)
+        else:
+            out, _ = layer(out, attention_mask=None)
+    if stack is not None:
+        install_activation_strategies(stack, [])
     out.float().square().mean().backward()
     ddp_model.finish_grad_sync()
 

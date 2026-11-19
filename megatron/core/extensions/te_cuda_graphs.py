@@ -216,7 +216,9 @@ class TECudaGraphMixin:
             else:
                 # Do CUDA Graphs replay.
                 cuda_graph_func = self._te_cuda_graph_replay
-            return cuda_graph_func(*args, **kwargs)
+            # The eager path enters the layer's FP8/FP4 context in GraphableMegatronModule.
+            with self.get_inner_quantization_context():
+                return cuda_graph_func(*args, **kwargs)
         return super().__call__(*args, **kwargs)
 
     def is_graphable_for_scope(self, modules):

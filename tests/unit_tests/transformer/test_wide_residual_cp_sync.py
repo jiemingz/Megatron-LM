@@ -9,11 +9,16 @@ import torch
 from torch import nn
 
 from megatron.core import parallel_state
+from megatron.core.activation_policy import (
+    ReplayRegion,
+    ResidualBranch,
+    ResidualReplayStrategy,
+    install_activation_strategies,
+)
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import (
     _allreduce_non_tensor_model_parallel_grads,
 )
-from megatron.core.transformer.residual_recompute import build_residual_stream_recompute_plan
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual import StreamwiseSigmoidWideResidualConnection
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
@@ -60,28 +65,41 @@ class _WideResidualReplayHarness(nn.Module):
             ]
         )
 
-    def forward(self, residual_stream: torch.Tensor, *, replay: bool) -> torch.Tensor:
-        contexts = build_residual_stream_recompute_plan(2, 2) if replay else [None, None]
-        for (reader, writer), context in zip(self.connections, contexts):
-            branch_input, state = reader(residual_stream, recompute_context=context)
+    def get_residual_branches_by_layer(self) -> list:
+        return [
+            [
+                ResidualBranch(
+                    read=ReplayRegion(reader, reader._compute_read),
+                    write=ReplayRegion(writer, writer._compute_write),
+                )
+            ]
+            for reader, writer in self.connections
+        ]
 
+    def _run_layer(self, index: int, residual_stream: torch.Tensor) -> torch.Tensor:
+        """The harness's one step: both layers (one replay block of two physical layers)."""
+        assert index == 0
+        for reader, writer in self.connections:
+            branch_input, state = reader(
+                residual_stream, fp32_residual_connection=False, branch_input_dtype=None
+            )
             branch_update = torch.tanh(branch_input) + 0.125 * branch_input
-            if context is not None and not context.is_block_end:
-                residual_stream = writer(
-                    branch_update,
-                    state=state,
-                    recompute_context=context,
-                    dropout_probability=0.0,
-                    training=False,
-                )
-            else:
-                residual_stream = writer(
-                    branch_update, state=state, dropout_probability=0.0, training=False
-                )
-            if context is not None:
-                context.finalize(residual_stream)
-
+            residual_stream = writer(
+                branch_update, state=state, dropout_probability=0.0, training=False
+            )
         return residual_stream
+
+    def forward(self, residual_stream: torch.Tensor, *, replay: bool) -> torch.Tensor:
+        # Both layers form one replay block; the second write is its live layer output.
+        if replay:
+            install_activation_strategies(
+                self, [ResidualReplayStrategy(self._run_layer, [self], block_size=2)]
+            )
+        try:
+            return self._run_layer(0, residual_stream)
+        finally:
+            if replay:
+                install_activation_strategies(self, [])
 
 
 def _config(

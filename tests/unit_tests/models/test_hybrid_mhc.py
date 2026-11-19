@@ -1,10 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from contextlib import nullcontext
+from unittest.mock import patch
 
 import pytest
 import torch
 
+from megatron.core.activation_policy import install_activation_strategies, installed_strategies
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
@@ -12,7 +14,10 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.pipeline_parallel.schedules import custom_backward, deallocate_output_tensor
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import (
+    CheckpointWithoutOutputManager,
+    model_parallel_cuda_manual_seed,
+)
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import (
     MegatronModule,
@@ -22,7 +27,7 @@ from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, install_residual_replay
 
 
 class _DummyHybridLayer(MegatronModule):
@@ -333,7 +338,6 @@ class TestHybridStackMHC:
             packed_seq_params,
             padding_mask,
             input_ids=None,
-            mhc_recompute_manager=None,
         ):
             seen_input_ids.append(input_ids)
             return original(
@@ -346,7 +350,6 @@ class TestHybridStackMHC:
                 packed_seq_params,
                 padding_mask,
                 input_ids,
-                mhc_recompute_manager,
             )
 
         monkeypatch.setattr(
@@ -642,50 +645,77 @@ class TestHybridStackMHC:
         )
         stack = _get_stack(config, num_local_layers=3)
 
-        managers, block_ends = stack._build_mhc_recompute_layer_plan(True)
+        def hooks(index):
+            """(hook kind, replay block) of each mHC point of layer ``index``, by method name."""
+            regions = installed_strategies(stack.layers[index].hyper_connection)
+            return {
+                (getattr(region, "__name__", None) or region.name): (
+                    type(hook).__name__,
+                    hook.block,
+                )
+                for region, strategies in regions.items()
+                for hook in strategies
+                if hasattr(hook, "block")
+            }
 
-        assert block_ends == [False, True, True]
-        assert managers[0] is managers[1]
-        assert managers[1] is not managers[2]
+        # Blocks [0, 1] and [2]: the layer-output update of a block's last layer stays live (it
+        # is not replayed); the block is finalized when that layer's step returns.
+        assert hooks(0) == {
+            "aggregate": ("_ReplayHook", 0),
+            "_expand_h_post": ("_ReplayHook", 0),
+            "_h_res_h_post_bda_layer_output": ("_ReplayHook", 0),
+        }
+        assert hooks(1) == {"aggregate": ("_ReplayHook", 0), "_expand_h_post": ("_ReplayHook", 0)}
+        assert hooks(2) == {"aggregate": ("_ReplayHook", 1), "_expand_h_post": ("_ReplayHook", 1)}
 
-    def test_boundary_bda_skips_recompute_manager(self, monkeypatch):
-        config = _get_config(num_layers=1)
+    def test_boundary_bda_skips_recompute_manager(self):
+        """The layer-output mHC update replays with its block except at the block end, whose
+        output is the live boundary the block replay hooks on."""
+        config = _get_config(
+            num_layers=1, recompute_granularity="selective", recompute_modules=["mhc"]
+        )
         layer = HyperConnectionHybridLayer(
             config=config, layer=_DummyHybridLayer(config, layer_number=1)
-        )
+        ).cuda()
         hidden_states = torch.randn(
-            4, 2, config.hidden_size * config.mhc_num_residual_streams, requires_grad=True
+            4,
+            2,
+            config.hidden_size * config.mhc_num_residual_streams,
+            device="cuda",
+            requires_grad=True,
         )
-        manager = type("_FakeManager", (), {})()
-        manager.is_last_layer_in_recompute_block = True
-        seen_managers = []
 
-        def fake_hyper_connection_forward(
-            hidden_states, mhc_recompute_manager=None, return_residual=False
-        ):
-            assert mhc_recompute_manager is manager
-            assert return_residual
-            sequence_length, batch_size, _ = hidden_states.shape
-            n = config.mhc_num_residual_streams
-            hidden_size = config.hidden_size
-            aggregated = hidden_states.view(sequence_length, batch_size, n, hidden_size).mean(dim=2)
-            h_res = torch.empty(sequence_length, batch_size, n, n)
-            h_post = torch.empty(sequence_length, batch_size, n)
-            return aggregated, h_res, h_post, hidden_states
+        next_layer = HyperConnectionHybridLayer(
+            config=config, layer=_DummyHybridLayer(config, layer_number=2)
+        ).cuda()
 
-        def fake_bda(
-            h_res, residual, h_post, output_with_bias, dropout_prob, training, fused, manager=None
-        ):
-            seen_managers.append(manager)
-            return residual
+        def regions_checkpointed(is_block_end):
+            # The layer ends its block alone, or is the first layer of a two-layer block.
+            layers = [layer] if is_block_end else [layer, next_layer]
+            stack = install_residual_replay(layers, block_size=len(layers))
+            finalized = []
+            finalize = (
+                CheckpointWithoutOutputManager.discard_all_outputs_and_register_unified_recompute
+            )
 
-        monkeypatch.setattr(layer.hyper_connection, "forward", fake_hyper_connection_forward)
-        monkeypatch.setattr(layer.hyper_connection, "fused_h_res_h_post_bda", fake_bda)
+            def record_finalize(manager, hook_tensor):
+                finalized.append(len(manager.checkpoints))
+                return finalize(manager, hook_tensor)
 
-        output, _ = layer(hidden_states, attention_mask=None, mhc_recompute_manager=manager)
-        assert output is hidden_states
-        assert seen_managers == [None]
+            with patch.object(
+                CheckpointWithoutOutputManager,
+                "discard_all_outputs_and_register_unified_recompute",
+                record_finalize,
+            ):
+                stack._run_layer(0, hidden_states, attention_mask=None)
+            open_manager = stack.replay.managers[0]
+            install_activation_strategies(stack, [])
+            if is_block_end:
+                assert open_manager is None
+                return finalized[0]
+            return len(open_manager.checkpoints)
 
-        manager.is_last_layer_in_recompute_block = False
-        layer(hidden_states, attention_mask=None, mhc_recompute_manager=manager)
-        assert seen_managers[-1] is manager
+        # aggregate + the layer-output H_res/H_post/BDA update inside the block ...
+        assert regions_checkpointed(is_block_end=False) == 2
+        # ... and only the aggregate at the block end.
+        assert regions_checkpointed(is_block_end=True) == 1

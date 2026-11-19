@@ -231,8 +231,16 @@ def get_mla_submodules(
     )
 
 
-def test_checkpointed_attention_forward_captures_metadata(monkeypatch):
-    """Optional metadata should stay in the closure instead of checkpoint tensor args."""
+def test_checkpointed_core_attention_captures_metadata(monkeypatch):
+    """Checkpointed core attention passes only tensors to the checkpoint; metadata stays closed
+    over."""
+    from megatron.core.activation_policy import (
+        CheckpointStrategy,
+        CheckpointWithoutOutputStrategy,
+        Event,
+        has_strategy,
+        install_activation_strategies,
+    )
 
     packed_seq_params = PackedSeqParams(qkv_format='thd')
     checkpoint_args = None
@@ -249,32 +257,60 @@ def test_checkpointed_attention_forward_captures_metadata(monkeypatch):
             del query, key, value, attention_mask
             assert kwargs["packed_seq_params"] is packed_seq_params
             assert kwargs["position_ids"] is None
+            assert kwargs["attn_mask_type"] is AttnMaskType.causal
             return kwargs["x"]
 
-    dummy_attention = type(
-        "DummyAttention",
-        (),
-        {"attn_mask_type": AttnMaskType.causal, "core_attention": CoreAttention()},
-    )()
+    config = SimpleNamespace(
+        recompute_granularity="selective",
+        recompute_modules=["core_attn", "mla_up_proj"],
+        fine_grained_activation_offloading=False,
+        offload_modules=[],
+    )
 
-    monkeypatch.setattr(absorbed_mla_module.tensor_parallel, "checkpoint", fake_checkpoint)
+    class Owner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = config
+            self.core_attention = CoreAttention()
+            self.linear_proj = torch.nn.Identity()
+
+        def _qkv_up_proj_and_rope(self, *args):
+            return args
+
+    owner = Owner()
+    install_activation_strategies(
+        owner,
+        [
+            CheckpointStrategy(owner.core_attention, impl="tensor_parallel", training_only=True),
+            CheckpointWithoutOutputStrategy(
+                owner._qkv_up_proj_and_rope, release_on=Event(owner.linear_proj, "enter")
+            ),
+        ],
+    )
+    assert has_strategy(owner, owner.core_attention, CheckpointStrategy)
+    assert has_strategy(owner, owner._qkv_up_proj_and_rope, CheckpointWithoutOutputStrategy)
+
+    monkeypatch.setattr(
+        "megatron.core.activation_policy.recompute.checkpointing.checkpoint", fake_checkpoint
+    )
 
     hidden_states = torch.randn(4, 1, 8)
-    output = AbsorbedMLASelfAttention._checkpointed_attention_forward(
-        dummy_attention,
-        q_absorbed=torch.randn(4, 1, 2, 8),
-        k_compressed=torch.randn(4, 1, 1, 8),
-        hidden_states=hidden_states,
-        q_compressed=torch.randn(4, 1, 8),
+    output = owner.core_attention(
+        torch.randn(4, 1, 2, 8),
+        torch.randn(4, 1, 1, 8),
+        value=None,
         attention_mask=torch.empty(1),
+        x=hidden_states,
+        qr=torch.randn(4, 1, 8),
         up_v_weight=torch.randn(2, 4, 4),
         position_ids=None,
         packed_seq_params=packed_seq_params,
+        attn_mask_type=AttnMaskType.causal,
     )
 
     assert checkpoint_args is not None
+    assert len(checkpoint_args) == 6
     assert all(arg is not packed_seq_params for arg in checkpoint_args)
-    assert all(arg is not None for arg in checkpoint_args)
     assert output is hidden_states
 
 

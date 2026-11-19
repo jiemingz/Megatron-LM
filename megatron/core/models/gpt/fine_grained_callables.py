@@ -5,7 +5,6 @@ from typing import Optional
 import torch
 from torch import Tensor
 
-from megatron.core import tensor_parallel
 from megatron.core.extensions.te_cuda_graphs import TECudaGraphMixin
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.fusions.fused_moe_residual_add import (
@@ -13,9 +12,6 @@ from megatron.core.fusions.fused_moe_residual_add import (
     fused_moe_residual_add,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    FineGrainedActivationOffloadingInterface as off_interface,
-)
 from megatron.core.pipeline_parallel.utils import ScheduleNode, StageDispatchBwdGrad
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
@@ -108,21 +104,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 )
                 if not isinstance(layer.mlp, MoELayer):
                     return hidden_states, None, None, None
-                mlp_norm_manager = off_interface(layer.offload_mlp_norm, hidden_states, "mlp_norm")
-                node.layer_state.mlp_norm_manager = mlp_norm_manager
-                if layer.recompute_pre_mlp_layernorm:
-                    layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
-                        retain_input_tensors=layer._pre_mlp_layernorm_returns_residual
-                    )
-                    with mlp_norm_manager as hidden_states:
-                        pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
-                            apply_module(layer.pre_mlp_layernorm), hidden_states
-                        )
-                else:
-                    with mlp_norm_manager as hidden_states:
-                        pre_mlp_layernorm_output = apply_module(layer.pre_mlp_layernorm)(
-                            hidden_states
-                        )
+                # Recompute/offload of the norm follow the layer's activation strategies; this
+                # schedule signals the layer's ``mlp_bda`` boundary in the later nodes.
+                pre_mlp_layernorm_output = apply_module(layer.pre_mlp_layernorm)(hidden_states)
 
                 # When using fused residual norm (e.g. TEFusedResidualRMSNorm),
                 # the layernorm returns (normalized_output, residual). Unpack
@@ -212,10 +196,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             tokens_per_expert = token_dispatcher._comm_manager.get_number_of_tokens_per_expert()
             node.layer_state.tokens_per_expert = tokens_per_expert
 
-        if layer.recompute_pre_mlp_layernorm:
-            # discard the output of the pre-mlp layernorm and register the recompute
-            # as a gradient hook of expert_output
-            layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(expert_output)
+        # This schedule no longer needs the pre-MLP norm output: release a recomputed norm here
+        # and rebuild it from the gradient of expert_output.
+        layer.fire_activation_boundary(layer._mlp_bda, "enter", [expert_output])
 
         return expert_output
 
@@ -259,14 +242,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 hidden_states = layer.mlp_bda(layer.training, layer.config.bias_dropout_fusion)(
                     (output, None), residual, layer.hidden_dropout
                 )
-        # Delay the offload of the mlp norm until after the mlp_bda has been computed
-        # because the residual is needed in the mlp_bda.
-        mlp_norm_manager = getattr(node.layer_state, 'mlp_norm_manager', None)
-        if mlp_norm_manager is not None:
-            hidden_states = mlp_norm_manager.group_offload(
-                hidden_states, forced_released_tensors=[residual]
-            )
-            node.layer_state.mlp_norm_manager = None
+        # The residual add is done: commit deferred offload groups (mlp_norm) of the layer.
+        hidden_states = layer.fire_activation_boundary(
+            layer._mlp_bda, "exit", hidden_states, inputs=((output, None), residual)
+        )
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )

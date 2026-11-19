@@ -9,6 +9,7 @@ import pytest
 import torch
 
 import megatron.core.transformer.multi_latent_attention as mla_module
+from megatron.core.activation_policy import CheckpointWithoutOutputStrategy, has_strategy
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
@@ -466,7 +467,11 @@ class TestParallelMLAAttention:
 
             output, bias = checkpointed_parallel_attention(hidden_states, attention_mask)
 
-            assert checkpointed_parallel_attention.recompute_up_proj == True
+            assert has_strategy(
+                checkpointed_parallel_attention,
+                checkpointed_parallel_attention._qkv_up_proj_and_rope,
+                CheckpointWithoutOutputStrategy,
+            )
             assert output.shape[0] == sequence_length
             assert output.shape[1] == micro_batch_size
             assert output.shape[2] == config.hidden_size

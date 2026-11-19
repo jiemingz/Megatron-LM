@@ -1,17 +1,25 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from unittest.mock import patch
+
+from unittest.mock import Mock
 
 import pytest
 import torch
 
+from megatron.core.activation_policy import (
+    ReplayRegion,
+    ResidualBranch,
+    Strategy,
+    has_strategy,
+    installed_strategies,
+)
+from megatron.core.activation_policy.recompute import replay as replay_module
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
     CheckpointWithoutOutputManager,
     initialize_rng_tracker,
 )
-from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock, TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -410,8 +418,9 @@ class TestCheckpointManagerPartialCheckpoint:
 #
 # These tests instantiate a full ``TransformerBlock`` with mHC enabled to
 # exercise:
-#   * the replay contexts the real block passes to its real layers, including
-#     the ``mhc_recompute_layer_num`` boundary case,
+#   * the block's mHC residual replay (``ResidualReplayStrategy``: which layers share a
+#     replay block, including the ``mhc_recompute_layer_num`` boundary case, and the
+#     live-boundary write that ends each block),
 #   * the ``HyperConnectionModule.input_expand`` / ``output_contract`` calls
 #     in ``TransformerBlock.forward`` for ``pre_process`` / ``post_process``
 #     stages.
@@ -465,35 +474,36 @@ class TestTransformerBlockMHCRecompute:
         return TransformerBlock(config, spec, pre_process=True, post_process=True).cuda(), config
 
     def _check_recompute_plan(self, block, expected_block_ends):
-        """Run the real block and check the replay context each real layer receives."""
-        from megatron.core.transformer.hyper_connection_transformer_layer import (
-            HyperConnectionTransformerLayer,
-        )
+        """Check which layers end an mHC replay block and which layers share one.
 
-        contexts = []
-        layer_call = HyperConnectionTransformerLayer.__call__
-
-        def record_context(layer, *args, **kwargs):
-            # Pass-through spy: each real layer still runs with the real context.
-            contexts.append(kwargs.get("residual_stream_recompute_context"))
-            return layer_call(layer, *args, **kwargs)
-
-        block.train()
-        seq_len, batch_size = 8, 2
-        hidden_states = torch.randn(
-            seq_len, batch_size, block.config.hidden_size, device="cuda", requires_grad=True
-        )
-        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=torch.bool, device="cuda")
-        with patch.object(HyperConnectionTransformerLayer, "__call__", record_context):
-            output = block(hidden_states=hidden_states, attention_mask=attention_mask)
-        output.sum().backward()
-
-        assert [context.is_block_end for context in contexts] == expected_block_ends
-        # Layers in one replay block share a manager; each new block gets a new one.
-        for previous, current in zip(contexts, contexts[1:]):
-            assert (current.manager is previous.manager) == (not previous.is_block_end)
-        assert all(context.manager.checkpoints for context in contexts)
-        assert hidden_states.grad is not None and torch.isfinite(hidden_states.grad).all()
+        A block's last layer keeps its layer-output mHC update live (it has no replay hook); the
+        block is finalized when that layer's step returns.
+        """
+        owners = [layer.mlp_hyper_connection for layer in block.layers]
+        tables = [installed_strategies(owner) for owner in owners]
+        ends = [
+            owner._h_res_h_post_bda_layer_output not in table
+            for owner, table in zip(owners, tables)
+        ]
+        assert ends == expected_block_ends, f"got {ends}, expected {expected_block_ends}"
+        # Layers in the same recompute block record into the same block; a block end starts
+        # the next one.
+        expected_blocks, current = [], 0
+        for end in expected_block_ends:
+            expected_blocks.append(current)
+            current += end
+        assert [
+            table[owner.aggregate][0].block for owner, table in zip(owners, tables)
+        ] == expected_blocks
+        (replay,) = [
+            strategy
+            for strategies in installed_strategies(block).values()
+            for strategy in strategies
+            if type(strategy).__name__ == "ResidualReplayStrategy"
+        ]
+        assert replay.block_end_steps == {
+            index: expected_blocks[index] for index, end in enumerate(expected_block_ends) if end
+        }
 
     def test_recompute_plan_no_layer_num(self):
         """Without ``mhc_recompute_layer_num`` only the final layer ends a recompute block."""
@@ -505,10 +515,25 @@ class TestTransformerBlockMHCRecompute:
         block, _ = self._make_mhc_block(num_layers=4, mhc_recompute_layer_num=2)
         self._check_recompute_plan(block, expected_block_ends=[False, True, False, True])
 
+    def test_recompute_plan_disabled(self, monkeypatch):
+        """Outside training nothing is replayed (no managers are allocated)."""
+        block, config = self._make_mhc_block(num_layers=3)
+        block.eval()
+        constructor = Mock(wraps=CheckpointWithoutOutputManager)
+        monkeypatch.setattr(replay_module, "CheckpointWithoutOutputManager", constructor)
+        hidden_states = torch.randn(8, 2, config.hidden_size, device='cuda', requires_grad=True)
+        attention_mask = torch.ones((1, 1, 8, 8), dtype=torch.bool, device='cuda')
+        block(hidden_states=hidden_states, attention_mask=attention_mask)
+        constructor.assert_not_called()
+
     def test_recompute_enablement_initialized(self):
-        """TransformerBlock records static mHC recompute enablement during initialization."""
+        """TransformerBlock installs mHC residual replay on its layers during initialization."""
         block, _ = self._make_mhc_block(num_layers=2)
-        assert block.mhc_recompute_enabled
+        block.train()
+        hc = block.layers[0].self_attention_hyper_connection
+        assert has_strategy(hc, hc.aggregate, Strategy)
+        assert has_strategy(hc, hc._h_res_h_post_bda, Strategy)
+        assert has_strategy(hc, hc._expand_h_post, Strategy)
 
     def test_plain_transformer_layer_still_fails_fast_in_transformer_block(self):
         """The Hybrid ownership exception must not weaken ordinary TransformerBlock wiring."""
@@ -555,7 +580,10 @@ class TestTransformerBlockMHCRecompute:
 
 
 class _RecordingMHCLayer(torch.nn.Module):
-    """Inert layer arithmetic isolates the real block's context and finalization protocol."""
+    """Inert layer arithmetic isolates the real block's replay and finalization protocol.
+
+    Each layer declares one residual branch: a ``read`` and a ``write`` method point on itself.
+    """
 
     supports_mhc_connections = True
 
@@ -567,11 +595,26 @@ class _RecordingMHCLayer(torch.nn.Module):
         self.calls = []
         self.outputs = []
 
+    def get_residual_branches_by_layer(self):
+        return [
+            [
+                ResidualBranch(
+                    read=ReplayRegion(self, self.read), write=ReplayRegion(self, self.write)
+                )
+            ]
+        ]
+
+    def read(self, value):
+        return value * 1.0
+
+    def write(self, value):
+        return value + self.layer_number
+
     def forward(self, hidden_states, context, **kwargs):
-        assert "mhc_recompute_manager" not in kwargs
         self.calls.append(kwargs)
         self.events.append("layer")
-        output = hidden_states + self.layer_number
+        branch = self.read(hidden_states)
+        output = self.write(branch)
         self.outputs.append(output)
         return output, context
 
@@ -593,12 +636,10 @@ def _make_recording_mhc_block(events, *, enabled=True):
     spec = TransformerBlockSubmodules(
         layer_specs=[ModuleSpec(module=_RecordingMHCLayer, params={"events": events})] * 3
     )
-    # Offloading is disabled; avoid constructing an external TE offload context.
-    with patch("megatron.core.transformer.transformer_block.get_cpu_offload_context", None):
-        return TransformerBlock(config, spec, post_process=False, pg_collection=groups)
+    return TransformerBlock(config, spec, post_process=False, pg_collection=groups)
 
 
-def test_block_forward_transports_fresh_contexts_and_finalizes_each_boundary_once(monkeypatch):
+def test_block_forward_finalizes_each_boundary_once_with_fresh_managers(monkeypatch):
     events, finalized = [], []
     block = _make_recording_mhc_block(events)
 
@@ -616,17 +657,12 @@ def test_block_forward_transports_fresh_contexts_and_finalizes_each_boundary_onc
         lambda *args: events.append("observe"),
     )
     inputs = torch.randn(2, 1, block.config.hidden_size, requires_grad=True)
-    plans = []
+    managers = []
     for pass_index in range(2):
         events.clear()
         output = block(hidden_states=inputs, attention_mask=None)
-        contexts = [layer.calls[-1]["residual_stream_recompute_context"] for layer in block.layers]
-        assert all(isinstance(context, ResidualStreamRecomputeContext) for context in contexts)
-        assert [context.is_block_end for context in contexts] == [False, True, True]
-        assert contexts[0].manager is contexts[1].manager
-        assert contexts[2].manager is not contexts[1].manager
-        # The dedicated caller must not mutate the flag still used by legacy Hybrid callers.
-        assert all(not context.manager.is_last_layer_in_recompute_block for context in contexts)
+        # Blocks [0, 1] and [2] (mhc_recompute_layer_num=2): each is finalized once, after its
+        # last layer's step, on that layer's (live) output.
         assert events == [
             "layer",
             "observe",
@@ -639,16 +675,15 @@ def test_block_forward_transports_fresh_contexts_and_finalizes_each_boundary_onc
         ]
         assert len(finalized) == 2 * (pass_index + 1)
         for (manager, boundary), layer_index in zip(finalized[-2:], (1, 2)):
-            assert manager is contexts[layer_index].manager
             assert boundary is block.layers[layer_index].outputs[-1]
+        assert finalized[-2][0] is not finalized[-1][0]
         assert output is block.layers[-1].outputs[-1]
-        plans.append(contexts)
-    assert all(new.manager is not old.manager for new in plans[1] for old in plans[0])
-    # Later layers and the next forward cannot change an earlier layer's boundary view.
-    assert [context.is_block_end for context in plans[0]] == [False, True, True]
+        managers.append([manager for manager, _ in finalized[-2:]])
+    # Each forward records into fresh managers.
+    assert all(new is not old for new in managers[1] for old in managers[0])
 
 
-def test_block_forward_omits_inactive_contexts_and_preserves_extraction_guard():
+def test_block_forward_replays_nothing_when_inactive_and_preserves_extraction_guard(monkeypatch):
     events = []
     block = _make_recording_mhc_block(events)
     inputs = torch.randn(2, 1, block.config.hidden_size, requires_grad=True)
@@ -657,14 +692,14 @@ def test_block_forward_omits_inactive_contexts_and_preserves_extraction_guard():
     assert not events
 
     block.eval()
+    constructor = Mock(wraps=CheckpointWithoutOutputManager)
+    monkeypatch.setattr(replay_module, "CheckpointWithoutOutputManager", constructor)
     output, extracted = block(hidden_states=inputs, attention_mask=None, extract_layer_indices={0})
     assert extracted[0] is block.layers[0].outputs[-1]
     assert output is block.layers[-1].outputs[-1]
-    assert all("residual_stream_recompute_context" not in layer.calls[-1] for layer in block.layers)
+    constructor.assert_not_called()
 
     disabled = _make_recording_mhc_block([], enabled=False)
     disabled(hidden_states=inputs, attention_mask=None)
-    assert disabled.training and not disabled.mhc_recompute_enabled
-    assert all(
-        "residual_stream_recompute_context" not in layer.calls[-1] for layer in disabled.layers
-    )
+    assert disabled.training
+    assert not any(installed_strategies(layer) for layer in disabled.layers)

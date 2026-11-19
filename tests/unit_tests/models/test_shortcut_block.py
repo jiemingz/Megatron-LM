@@ -1,12 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
 import torch
 import transformer_engine as te
 
+from megatron.core.activation_policy import strategies as activation_policy_strategies
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.models.hybrid.shortcut_block import (
@@ -14,7 +15,6 @@ from megatron.core.models.hybrid.shortcut_block import (
     group_layers_into_shortcut_blocks,
 )
 from megatron.core.transformer.module import TwoStageAttentionLayer
-from megatron.core.transformer.residual_recompute import build_residual_stream_recompute_plan
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.wide_residual import StreamwiseSigmoidWideResidualConnection
@@ -57,6 +57,9 @@ class _FakeCompute(torch.nn.Module, TwoStageAttentionLayer):
 
     def supports_two_stage_attention(self) -> bool:
         return self.supports_two_stage
+
+    def get_inner_quantization_context(self):
+        return nullcontext()
 
     def forward_pre_attn_and_core_attn(self, hidden_states, **kwargs):
         return (hidden_states,)
@@ -104,6 +107,9 @@ class _FakeMoE(torch.nn.Module):
             self.residual_write_mlp = StreamwiseSigmoidWideResidualConnection(
                 config, layer_number, "mlp", operation="write"
             )
+
+    def get_inner_quantization_context(self):
+        return nullcontext()
 
     def _pre_mlp_layernorm_and_residual(self, hidden_states):
         """Stand-in for the layer protocol: norm output, residual, and an empty payload."""
@@ -190,7 +196,7 @@ def test_wide_shortcut_owns_independent_registered_read():
     wide_hidden = torch.randn(
         5, 3 * config.hidden_size, device=torch.cuda.current_device(), requires_grad=True
     )
-    shortcut_hidden = block._read_shortcut_hidden(wide_hidden, recompute_context=None)
+    shortcut_hidden = block._read_shortcut_hidden(wide_hidden)
 
     assert shortcut_hidden.shape == (5, config.hidden_size)
     shortcut_hidden.square().mean().backward()
@@ -214,7 +220,7 @@ def test_wide_shortcut_mtp_pair_stays_ordinary_width():
 
     assert block.is_mtp_layer
     assert block.shortcut_residual_read is None
-    assert block._read_shortcut_hidden(ordinary_hidden, recompute_context=None) is ordinary_hidden
+    assert block._read_shortcut_hidden(ordinary_hidden) is ordinary_hidden
     assert not any("shortcut_residual_read" in key for key in block.state_dict())
 
 
@@ -227,8 +233,9 @@ def test_shortcut_pair_rejects_mixed_mtp_ownership():
         ShortcutMoEBlock(compute, _FakeMoE(config), overlap_a2a=False)
 
 
-@pytest.mark.parametrize("residual_replay", [False, True], ids=["eager", "replay"])
-def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
+def test_shortcut_converts_cp_layout_between_its_layers(monkeypatch):
+    """The layer stack prepares the pair's input for the attention layer and finalizes the
+    output after the MoE layer; the pair converts to the MoE layer's layout itself."""
     config = _shortcut_config()
     attn_layer = _FakeCompute(config)
     moe_layer = _FakeMoE(config)
@@ -237,12 +244,6 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
     )
     calls = []
     observed = {}
-    attn_context, moe_context = (
-        build_residual_stream_recompute_plan(2, 2) if residual_replay else (None, None)
-    )
-    expected_layer_kwargs = (
-        {"residual_stream_recompute_context": attn_context} if residual_replay else {}
-    )
     input_padding_mask = torch.tensor([[False, True]])
     moe_padding_mask = torch.tensor([[True, False]])
     masks_by_layout = {"zigzag": moe_padding_mask}
@@ -265,25 +266,18 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
     def attn_forward(hidden_states, packed_seq_params=None, **kwargs):
         observed["attn_packed"] = packed_seq_params
         observed["cp_metadata"] = kwargs.get("packed_sequence_cp_metadata")
-        assert {
-            key: value
-            for key, value in kwargs.items()
-            if key == "residual_stream_recompute_context"
-        } == expected_layer_kwargs
         return (hidden_states,)
 
     def attn_post(hidden_states, **kwargs):
-        assert kwargs == expected_layer_kwargs
+        assert kwargs == {}
         return hidden_states
 
-    def route(shortcut_hidden, padding_mask=None, packed_seq_params=None, recompute_context=None):
-        assert recompute_context is attn_context
+    def route(shortcut_hidden, padding_mask=None, packed_seq_params=None):
         observed["route_packed"] = packed_seq_params
         assert padding_mask is moe_padding_mask
         return shortcut_hidden, shortcut_hidden
 
-    def shared(hidden_states, padding_mask=None, packed_seq_params=None, recompute_context=None):
-        assert recompute_context is moe_context
+    def shared(hidden_states, padding_mask=None, packed_seq_params=None):
         observed["shared_packed"] = packed_seq_params
         assert padding_mask is moe_padding_mask
         return torch.zeros_like(hidden_states), None, hidden_states, ()
@@ -295,15 +289,9 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
         packed_seq_params=None,
         moe_unflatten_mbs=None,
         mlp_state=(),
-        recompute_context=None,
     ):
-        assert recompute_context is moe_context
         observed["postprocess_packed"] = packed_seq_params
         return residual
-
-    @contextmanager
-    def quant_context_factory(*_args):
-        yield
 
     monkeypatch.setattr(attn_layer, "forward_pre_attn_and_core_attn", attn_forward)
     monkeypatch.setattr(attn_layer, "forward_post_core_attn", attn_post)
@@ -324,17 +312,15 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
         inference_context=None,
         rotary_pos_emb=None,
         sequence_len_offset=None,
-        packed_seq_params="packed-input",
+        packed_seq_params="packed-4",
         padding_mask=input_padding_mask,
-        quant_context_factory=quant_context_factory,
         cp_layout_state=RecordingCPLayoutState(),
         packed_sequence_cp_metadata=cp_metadata,
-        attn_recompute_context=attn_context,
-        moe_recompute_context=moe_context,
         padding_mask_by_layout=masks_by_layout,
     )
 
-    assert calls == [("prepare", 4), ("prepare", 5), ("prepare", 5), ("finalize", 5)]
+    # The shortcut input and the attention output each move to the MoE layer's layout.
+    assert calls == [("prepare", 5), ("prepare", 5)]
     assert observed == {
         "attn_packed": "packed-4",
         "cp_metadata": cp_metadata,
@@ -342,7 +328,7 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
         "shared_packed": "packed-5",
         "postprocess_packed": "packed-5",
     }
-    torch.testing.assert_close(output, hidden_states + 14)
+    torch.testing.assert_close(output, hidden_states + 5)
 
 
 def test_inference_runs_paired_layer_atomically(monkeypatch):
@@ -367,20 +353,16 @@ def test_inference_runs_paired_layer_atomically(monkeypatch):
     def two_stage(*_args, **_kwargs):
         raise AssertionError("inference must not use the two-stage training path")
 
-    def route(shortcut_hidden, padding_mask=None, packed_seq_params=None, recompute_context=None):
+    def route(shortcut_hidden, padding_mask=None, packed_seq_params=None):
         observed["route_input"] = shortcut_hidden
         return shortcut_hidden, shortcut_hidden
 
-    def shared(hidden_states, padding_mask=None, packed_seq_params=None, recompute_context=None):
+    def shared(hidden_states, padding_mask=None, packed_seq_params=None):
         observed["shared_input"] = hidden_states
         return torch.zeros_like(hidden_states), None, hidden_states, ()
 
     def postprocess(residual, combined_output, shared_expert_output, **_kwargs):
         return residual + combined_output
-
-    @contextmanager
-    def quant_context_factory(*_args):
-        yield
 
     monkeypatch.setattr(compute_layer, "forward", compute_forward)
     monkeypatch.setattr(compute_layer, "forward_pre_attn_and_core_attn", two_stage)
@@ -410,7 +392,6 @@ def test_inference_runs_paired_layer_atomically(monkeypatch):
             sequence_len_offset=None,
             packed_seq_params=None,
             padding_mask=None,
-            quant_context_factory=quant_context_factory,
         )
     finally:
         InferenceMode.unset_active()
@@ -535,6 +516,9 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
             self.input_scale = torch.nn.Parameter(torch.tensor(2.0))
             self.output_scale = torch.nn.Parameter(torch.tensor(3.0))
 
+        def get_inner_quantization_context(self):
+            return quantization_context(self.layer_number - 1)
+
         def forward_pre_attn_and_core_attn(self, hidden_states, **kwargs):
             assert_quant_layer(0)
             return hidden_states * self.input_scale, hidden_states
@@ -577,17 +561,16 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
             self.shared_scale = torch.nn.Parameter(torch.tensor(19.0))
             self.mlp = FakeMLP()
 
+        def get_inner_quantization_context(self):
+            return quantization_context(self.layer_number - 1)
+
         def shortcut_route_preprocess(
-            self, shortcut_hidden, padding_mask=None, packed_seq_params=None, recompute_context=None
+            self, shortcut_hidden, padding_mask=None, packed_seq_params=None
         ):
-            assert recompute_context is None
             assert_quant_layer(1)
             return shortcut_hidden * self.route_scale, shortcut_hidden * self.prob_scale
 
-        def shortcut_shared_experts(
-            self, hidden_states, padding_mask=None, packed_seq_params=None, recompute_context=None
-        ):
-            assert recompute_context is None
+        def shortcut_shared_experts(self, hidden_states, padding_mask=None, packed_seq_params=None):
             assert_quant_layer(1)
             return hidden_states * self.shared_scale, None, hidden_states, ()
 
@@ -600,7 +583,7 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
             return output_with_bias[0] + residual
 
     @contextmanager
-    def quant_context_factory(config, layer_number):
+    def quantization_context(layer_number):
         active_quant_layers.append(layer_number)
         try:
             yield
@@ -642,7 +625,6 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
             sequence_len_offset=None,
             packed_seq_params=None,
             padding_mask=None,
-            quant_context_factory=quant_context_factory,
         )
         output.sum().backward()
         gradients = {
@@ -668,11 +650,13 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
 
 def test_shortcut_norm_recompute_and_offload(monkeypatch):
     """The shortcut path wires pre-norm recompute and post-norm offload together."""
-    from megatron.core.models.hybrid import shortcut_block as shortcut_block_module
 
     calls = {}
 
     class RecordingCheckpoint:
+        def __init__(self, *args, **kwargs):
+            pass
+
         def checkpoint(self, run_function, hidden_states):
             calls["checkpoint_input"] = hidden_states
             calls["checkpoint_output"] = run_function(hidden_states)
@@ -695,14 +679,18 @@ def test_shortcut_norm_recompute_and_offload(monkeypatch):
         def __exit__(self, *_args):
             calls["offload_exited"] = True
 
-        def group_offload(self, tensor, forced_released_tensors=None):
+        def group_offload(self, tensor, forced_released_tensors=None, delay_offload=False):
             calls["offloaded_tensor"] = tensor
             calls["forced_released_tensors"] = forced_released_tensors
             return tensor
 
-    monkeypatch.setattr(shortcut_block_module, "CheckpointWithoutOutput", RecordingCheckpoint)
+    # The activation-policy runtime creates the checkpoint and the offload group.
     monkeypatch.setattr(
-        shortcut_block_module, "_get_offloading_interface", lambda: RecordingOffload
+        "megatron.core.activation_policy.recompute.checkpointing.CheckpointWithoutOutput",
+        RecordingCheckpoint,
+    )
+    monkeypatch.setattr(
+        activation_policy_strategies, "_offload_interface", lambda: RecordingOffload
     )
 
     config = _shortcut_config()
@@ -742,10 +730,6 @@ def test_shortcut_norm_recompute_and_offload(monkeypatch):
         2, 1, config.hidden_size, device=torch.cuda.current_device(), requires_grad=True
     )
 
-    @contextmanager
-    def quant_context_factory(*_args):
-        yield
-
     output = block(
         hidden_states=hidden_states,
         attention_mask=None,
@@ -754,13 +738,11 @@ def test_shortcut_norm_recompute_and_offload(monkeypatch):
         sequence_len_offset=None,
         packed_seq_params=None,
         padding_mask=None,
-        quant_context_factory=quant_context_factory,
     )
     output.sum().backward()
 
     assert calls["checkpoint_input"] is hidden_states
     assert calls["recompute_hook"] is calls["combined_output"]
-    assert block.shortcut_pre_mlp_layernorm_checkpoint is None
     assert calls["offload_enabled"]
     assert calls["offload_name"] == "shortcut_post_norm"
     assert calls["offload_input"] is calls["combined_output"]

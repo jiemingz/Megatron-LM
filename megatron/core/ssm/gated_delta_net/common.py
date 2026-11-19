@@ -16,7 +16,11 @@ from typing import Optional, Protocol, Union
 import torch
 import torch.nn as nn
 
-from megatron.core import tensor_parallel
+from megatron.core.activation_policy import (
+    CheckpointStrategy,
+    CheckpointWithoutOutputStrategy,
+    Event,
+)
 from megatron.core.fp8_utils import get_fp8_align_size, get_fp8_disabled_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
@@ -374,13 +378,6 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         for param in self.out_norm.parameters():
             setattr(param, "sum_gradients_across_tp_domain", True)
 
-        self.recompute_norm_out = False
-        self.norm_out_checkpoint = None
-        self.recompute_gdn = False
-        if self.config.recompute_granularity == "selective" and self.config.recompute_modules:
-            self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
-            self.recompute_gdn = "gdn" in self.config.recompute_modules
-
         self.out_proj = _build_with_kda_fp8_disabled(
             self.config,
             submodules.out_proj,
@@ -401,10 +398,42 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         self._chunkwise_cp_context_cache: dict[tuple[int, int], tuple[torch.Tensor, object]] = {}
 
         self.reset_parameters()
+        # Activation strategies (points: ``_gdn_forward``, the whole layer;
+        # ``_gated_norm_and_a2a``, the gated output norm and its layout restore; ``out_proj``,
+        # the output projection). Every variant implements these points. The config rejects
+        # these recomputes together with the two-stage (shortcut) path.
+        config = self.config
+        activation_strategies = []
+        if config.recompute_selected("gdn_norm_out"):
+            from megatron.core.ssm.gated_delta_net.kda import KimiDeltaAttention
+
+            # Released once out_proj returns, so the rebuild hooks on the projection output. KDA
+            # only ever recomputed its norm while training; GDN and GDN2 also do in eval.
+            activation_strategies.append(
+                CheckpointWithoutOutputStrategy(
+                    self._gated_norm_and_a2a,
+                    release_on=Event(self.out_proj, "exit"),
+                    training_only=isinstance(self, KimiDeltaAttention),
+                )
+            )
+        if config.recompute_selected("gdn"):
+            activation_strategies.append(
+                CheckpointStrategy(
+                    self._gdn_forward,
+                    training_only=True,
+                    distribute_saved_activations=config.distribute_saved_activations,
+                )
+            )
+        self.install_activation_strategies(activation_strategies)
 
     def supports_two_stage_attention(self) -> bool:
-        """Recomputation requires the original atomic forward path."""
-        return not (self.recompute_norm_out or self.recompute_gdn)
+        """GDN variants support the two-stage path.
+
+        The ``gdn_norm_out`` recompute releases its output at the ``out_proj`` exit and the
+        ``gdn`` checkpoint wraps both stages, so neither can be split across the two-stage
+        boundary; TransformerConfig rejects them together with ``moe_shortcut_connection``.
+        """
+        return True
 
     def forward_post_core_attn(
         self, norm_out: torch.Tensor
@@ -413,10 +442,6 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         nvtx_range_push(suffix="out_proj")
         out, out_bias = self.out_proj(norm_out)
         nvtx_range_pop(suffix="out_proj")
-
-        if self.recompute_norm_out:
-            self.norm_out_checkpoint.discard_output_and_register_recompute(out)
-
         return out, out_bias
 
     def _validate_runtime_cp_size(self, cp_size: int) -> None:
@@ -485,34 +510,27 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run a GDN variant's recurrence followed by its output projection."""
-        if self.recompute_gdn and self.training:
+        return self._gdn_forward(
+            hidden_states,
+            attention_mask,
+            inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            inference_params=inference_params,
+            **kwargs,
+        )
 
-            def _checkpointed_forward(hidden_states):
-                norm_out = self.forward_pre_attn_and_core_attn(
-                    hidden_states,
-                    attention_mask,
-                    inference_context=inference_context,
-                    packed_seq_params=packed_seq_params,
-                    sequence_len_offset=sequence_len_offset,
-                    inference_params=inference_params,
-                    **kwargs,
-                )
-                return self.forward_post_core_attn(norm_out)
-
-            if self.config.fp8 or self.config.fp4:
-                from megatron.core.extensions.transformer_engine import te_checkpoint
-
-                return te_checkpoint(
-                    _checkpointed_forward,
-                    self.config.distribute_saved_activations,
-                    get_cuda_rng_tracker,
-                    self.pg_collection.tp,
-                    hidden_states,
-                )
-            return tensor_parallel.checkpoint(
-                _checkpointed_forward, self.config.distribute_saved_activations, hidden_states
-            )
-
+    def _gdn_forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        inference_context: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[int] = None,
+        inference_params: Optional[BaseInferenceContext] = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """The whole layer: the recurrence followed by the output projection."""
         norm_out = self.forward_pre_attn_and_core_attn(
             hidden_states,
             attention_mask,

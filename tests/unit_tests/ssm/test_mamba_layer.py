@@ -75,21 +75,16 @@ class TestMambaLayer:
         monkeypatch.setattr(self.layer, "_prepare_residual", prepare_residual)
         monkeypatch.setattr(self.layer, "_prepare_mixer_input", prepare_input)
         monkeypatch.setattr(self.layer, "_apply_mixer_bda", apply_bda)
-        context = object()
-        prepared, replay = self.layer._prepare_mixer_state(
-            hidden_states, residual_stream_recompute_context=context
-        )
-        branch_input, residual = prepared
+        branch_input, residual = self.layer._prepare_mixer_state(hidden_states)
         prepare_residual.assert_called_once_with(hidden_states)
         prepare_input.assert_called_once_with(hidden_states)
         assert branch_input is hidden_states
-        assert replay is None
         assert residual.dtype == (torch.float32 if fp32_residual else torch.bfloat16)
         assert norm.call_args.args[0] is hidden_states
         torch.testing.assert_close(residual, hidden_states.to(residual.dtype), rtol=0, atol=0)
 
         mixer_output = (torch.zeros_like(branch_input), None)
-        output = self.layer._apply_mixer_update(mixer_output, residual, recompute_context=context)
+        output = self.layer._apply_mixer_update(mixer_output, residual)
         apply_bda.assert_called_once_with(mixer_output, residual)
         assert output.dtype == residual.dtype
         torch.testing.assert_close(output, residual, rtol=0, atol=0)
@@ -182,15 +177,9 @@ class TestMambaLayer:
 
         write = Mock(return_value=split_output)
         monkeypatch.setattr(layer, "_apply_mixer_update", write)
-        recompute_context = object()
-        assert (
-            layer.forward_post_core_attn(
-                *stage_state, residual_stream_recompute_context=recompute_context
-            )
-            is split_output
-        )
+        assert layer.forward_post_core_attn(*stage_state) is split_output
+        # The write gets the connection state the first stage produced.
         assert write.call_args.args[1] is stage_state[2]
-        assert write.call_args.kwargs["recompute_context"] is recompute_context
 
     def test_gpu_forward(self):
         layer = self.layer

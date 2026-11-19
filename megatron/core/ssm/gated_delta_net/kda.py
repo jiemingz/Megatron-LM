@@ -4,13 +4,11 @@
 
 import math
 from dataclasses import dataclass
-from functools import partial
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
 
-from megatron.core import tensor_parallel
 from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
@@ -22,7 +20,6 @@ from megatron.core.ssm.gated_delta_net.common import (
     _build_with_kda_fp8_disabled,
     _GDNBase,
     a2a_cp_to_hp,
-    a2a_hp_to_cp,
     build_cp_context,
     causal_conv1d,
     get_parameter_local_cp,
@@ -391,53 +388,22 @@ class KimiDeltaAttention(_GDNBase):
         else:
             chunkwise_cp_context = None
 
-        if self.recompute_gdn and self.training:
-
-            def _checkpointed_compute(hidden_states):
-                return self._forward_compute(
-                    hidden_states,
-                    batch,
-                    seq_len_post_headwise,
-                    cp_size_headwise,
-                    cp_group_headwise,
-                    cp_size_chunkwise,
-                    cp_group_chunkwise,
-                    cu_seqlens_q,
-                    packed_seq_params,
-                    chunkwise_cp_context,
-                )
-
-            if self.config.fp8 or self.config.fp4:
-                from megatron.core.extensions.transformer_engine import te_checkpoint
-
-                out, out_bias = te_checkpoint(
-                    _checkpointed_compute,
-                    self.config.distribute_saved_activations,
-                    tensor_parallel.random.get_cuda_rng_tracker,
-                    self.pg_collection.tp,
-                    hidden_states,
-                )
-            else:
-                out, out_bias = tensor_parallel.checkpoint(
-                    _checkpointed_compute, self.config.distribute_saved_activations, hidden_states
-                )
-        else:
-            out, out_bias = self._forward_compute(
-                hidden_states,
-                batch,
-                seq_len_post_headwise,
-                cp_size_headwise,
-                cp_group_headwise,
-                cp_size_chunkwise,
-                cp_group_chunkwise,
-                cu_seqlens_q,
-                packed_seq_params,
-                chunkwise_cp_context,
-            )
+        out, out_bias = self._gdn_forward(
+            hidden_states,
+            batch,
+            seq_len_post_headwise,
+            cp_size_headwise,
+            cp_group_headwise,
+            cp_size_chunkwise,
+            cp_group_chunkwise,
+            cu_seqlens_q,
+            packed_seq_params,
+            chunkwise_cp_context,
+        )
 
         return out, out_bias
 
-    def _forward_compute(
+    def _gdn_forward(  # pylint: disable=arguments-differ
         self,
         hidden_states,
         batch,
@@ -557,72 +523,24 @@ class KimiDeltaAttention(_GDNBase):
         )
         nvtx_range_pop(suffix="gated_delta_rule")
 
-        if self.recompute_norm_out and self.training:
-            self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            norm_func = partial(
-                self._gated_norm_and_layout_restore,
-                thd_cp_a2a_inv=thd_cp_a2a_inv,
-                batch=batch,
-                seq_len=seq_len_post_headwise,
-                packed_seq_params=packed_seq_params,
-                cp_size_headwise=cp_size_headwise,
-                cp_group_headwise=cp_group_headwise,
-                cp_size_chunkwise=cp_size_chunkwise,
-                cp_group_chunkwise=cp_group_chunkwise,
-                cu_seqlens_q=cu_seqlens_q,
-            )
-            norm_out = self.norm_out_checkpoint.checkpoint(norm_func, core_attn_out, gate)
-        else:
-            norm_out = self._gated_norm_and_layout_restore(
-                core_attn_out,
-                gate,
-                thd_cp_a2a_inv,
-                batch,
-                seq_len_post_headwise,
-                packed_seq_params,
-                cp_size_headwise,
-                cp_group_headwise,
-                cp_size_chunkwise,
-                cp_group_chunkwise,
-                cu_seqlens_q,
-            )
+        # Gated output norm and headwise-CP layout restore (shared with GDN/GDN2).
+        norm_out = self._gated_norm_and_a2a(
+            core_attn_out,
+            gate,
+            thd_cp_a2a_inv=thd_cp_a2a_inv,
+            batch=batch,
+            seq_len=seq_len_post_headwise,
+            cp_size=cp_size_headwise,
+            cp_group=cp_group_headwise,
+            packed_seq_params=packed_seq_params,
+        )
 
         # Output projection.
         nvtx_range_push(suffix="out_proj")
         out, out_bias = self._proj(self.out_proj, norm_out)
         nvtx_range_pop(suffix="out_proj")
 
-        if self.recompute_norm_out and self.training:
-            self.norm_out_checkpoint.discard_output_and_register_recompute(out)
-
         return out, out_bias
-
-    def _gated_norm_and_layout_restore(
-        self,
-        core_attn_out: torch.Tensor,
-        gate: torch.Tensor,
-        thd_cp_a2a_inv: torch.Tensor | None,
-        batch: int,
-        seq_len: int,
-        packed_seq_params: PackedSeqParams | None,
-        cp_size_headwise: int,
-        cp_group_headwise: torch.distributed.ProcessGroup | None,
-        cp_size_chunkwise: int,
-        cp_group_chunkwise: torch.distributed.ProcessGroup | None,
-        cu_seqlens_q: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Apply KDA's gated output norm and restore its context-parallel layout."""
-
-        nvtx_range_push(suffix="gated_norm")
-        norm_out = self._apply_gated_norm(core_attn_out, gate)
-        nvtx_range_pop(suffix="gated_norm")
-
-        norm_out = norm_out.reshape(batch, seq_len, -1)
-        norm_out = norm_out.transpose(0, 1).contiguous()
-
-        return a2a_hp_to_cp(
-            norm_out, cp_size_headwise, cp_group_headwise, packed_seq_params, thd_cp_a2a_inv
-        )
 
     def pre_gated_delta_rule(
         self,

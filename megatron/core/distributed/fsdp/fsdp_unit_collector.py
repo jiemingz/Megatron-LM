@@ -15,41 +15,20 @@
 """Select MCore modules for MFSDP v2 sharding."""
 
 from collections.abc import Iterator, Sequence
-from typing import NamedTuple
 
 from torch import nn
 
+from megatron.core.activation_policy import (
+    CheckpointStrategy,
+    CheckpointWithoutOutputStrategy,
+    installed_strategies,
+)
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_layer import TransformerLayer
-
-
-class _SelectiveRecompute(NamedTuple):
-    """A rule for a module's internal selective checkpoint.
-
-    The checkpoint replays an internal callable without re-entering the module's
-    forward hooks. The region conservatively identifies parameters to inspect.
-    """
-
-    # Name of the bool attribute a module sets to True at construction when it recomputes,
-    # e.g. "recompute_mlp" for TransformerLayer.
-    recompute_flag_name: str
-    # Name of the module's attribute holding the region root, e.g. "mlp" for
-    # TransformerLayer, or None to inspect the current module's subtree.
-    recomputed_submodule_name: str | None
-
-
-_SELECTIVE_RECOMPUTES = (
-    _SelectiveRecompute("recompute_mlp", "mlp"),  # TransformerLayer, "mlp"
-    _SelectiveRecompute("moe_layer_recompute", None),  # MoELayer or MoETransformerLayer, "moe"
-    _SelectiveRecompute("shared_experts_recompute", "shared_experts"),  # MoELayer
-    _SelectiveRecompute("recompute_up_proj", None),  # MLA variants, "mla_up_proj"
-    _SelectiveRecompute("recompute_gdn", None),  # Gated delta net variants, "gdn"
-    _SelectiveRecompute("recompute_in_proj", "in_proj"),  # GatedDeltaProductMixer, "gdp_in_proj"
-)
 
 
 class FsdpUnitCollector:
@@ -199,16 +178,16 @@ def _rerun_submodules(module: nn.Module) -> list[nn.Module]:
             return [module]
         return []
 
-    # Selective recompute flags are set from each module's own config.
+    # Selective recompute: points whose installed strategies rerun them in backward. A child
+    # module point is rerun through its own ``__call__``, but not its enclosing unit's; a method
+    # point reruns part of this module. Strategies are installed from each module's own config.
     rerun = []
-    for recompute in _SELECTIVE_RECOMPUTES:
-        if getattr(module, recompute.recompute_flag_name, False) is not True:
+    for region, strategies in installed_strategies(module).items():
+        if not any(
+            isinstance(strategy, (CheckpointStrategy, CheckpointWithoutOutputStrategy))
+            or strategy.replays
+            for strategy in strategies
+        ):
             continue
-        if recompute.recomputed_submodule_name is None:
-            rerun.append(module)
-            continue
-        # The submodule may be absent, e.g. shared_experts is None without shared experts.
-        submodule = getattr(module, recompute.recomputed_submodule_name, None)
-        if submodule is not None:
-            rerun.append(submodule)
+        rerun.append(region if isinstance(region, nn.Module) else module)
     return rerun

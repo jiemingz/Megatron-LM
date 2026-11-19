@@ -2,7 +2,6 @@
 """Local state plumbing through real Mamba schedules with a small deterministic mixer."""
 
 import copy
-from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +9,8 @@ import torch
 from torch import nn
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from megatron.core.activation_policy import install_activation_strategies
+from megatron.core.activation_policy.recompute import replay as replay_module
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.ssm.wide_residual_mamba_layer import WideResidualMambaLayer
@@ -19,6 +20,7 @@ from megatron.core.transformer.wide_residual import (
     load_residual_state,
 )
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
+from tests.unit_tests.test_utilities import install_residual_replay
 
 
 class _Mixer(nn.Module):
@@ -180,14 +182,13 @@ def test_shared_schedule_keeps_state_opaque_and_call_local(monkeypatch, two_stag
     contexts = []
     updates = []
 
-    def prepare(value, residual_stream_recompute_context=None):
+    def prepare(value):
         # Neither a tensor nor a residual-first tuple: only the matching update knows it.
         state = SimpleNamespace(residual=value)
         contexts.append(state)
-        return ResidualBranchInput(value, state), None
+        return ResidualBranchInput(value, state)
 
-    def update(output, state, recompute_context=None):
-        assert recompute_context is None
+    def update(output, state):
         assert any(state is context for context in contexts)
         updates.append(state)
         return output[0] + state.residual
@@ -196,18 +197,14 @@ def test_shared_schedule_keeps_state_opaque_and_call_local(monkeypatch, two_stag
     monkeypatch.setattr(layer, "_apply_mixer_update", update)
     first, second = (torch.randn(2, 1, 8, dtype=torch.bfloat16) for _ in range(2))
     if two_stage:
-        first_stage = layer.forward_pre_attn_and_core_attn(
-            first, residual_stream_recompute_context=object()
-        )
-        second_stage = layer.forward_pre_attn_and_core_attn(
-            second, residual_stream_recompute_context=object()
-        )
+        first_stage = layer.forward_pre_attn_and_core_attn(first)
+        second_stage = layer.forward_pre_attn_and_core_attn(second)
         # Finish in reverse order so one invocation cannot overwrite the other's state.
         layer.forward_post_core_attn(*second_stage)
         layer.forward_post_core_attn(*first_stage)
     else:
-        layer.forward(first, residual_stream_recompute_context=object())
-        layer.forward(second, residual_stream_recompute_context=object())
+        layer.forward(first)
+        layer.forward(second)
     expected_updates = contexts[::-1] if two_stage else contexts
     assert len(updates) == len(expected_updates) == 2
     assert all(actual is expected for actual, expected in zip(updates, expected_updates))
@@ -286,40 +283,43 @@ def test_wide_operations_use_current_registered_owners():
     assert events == ["residual_read", "residual_write"]
 
 
-class _RecordingContext:
-    """Record checkpoint selection, not actual discard/replay execution."""
-
-    def __init__(self, is_block_end) -> None:
-        self.is_block_end = is_block_end
-        self.calls = []
-
-    def checkpoint(self, function, *args):
-        target = function.func if isinstance(function, partial) else function
-        self.calls.append(getattr(target, "__name__", type(target).__name__))
-        return function(*args)
-
-
 @pytest.mark.parametrize("wide", [False, True], ids=["ordinary", "wr"])
 @pytest.mark.parametrize("is_block_end", [False, True])
-def test_replay_selection_stays_in_layer_binding(wide, is_block_end):
+def test_replay_selection_stays_in_layer_binding(monkeypatch, wide, is_block_end):
+    """Residual replay records the WR read, the connected norm and, unless the layer ends its
+    replay block, the write; an ordinary layer has nothing to replay."""
     layer = _layer(wide, True)
-    context = _RecordingContext(is_block_end)
+    # The layer alone is a block, or the first layer of a two-layer block.
+    layers = [layer] if is_block_end else [layer, _layer(wide, True)]
+    stack = install_residual_replay(layers, block_size=len(layers))
+    replayed = []
+    run = replay_module._ReplayHook.run
+
+    def record(hook, call, *args):
+        point = call.name  # the connections' read/write arithmetic, or the norm module
+        replayed.append(
+            "norm"
+            if isinstance(point, nn.Module)
+            else {"_compute_read": "read", "_compute_write": "write"}[
+                getattr(point, "__name__", None) or point.name
+            ]
+        )
+        return run(hook, call, *args)
+
+    monkeypatch.setattr(replay_module._ReplayHook, "run", record)
     value = torch.randn(2, 1, 24 if wide else 8, requires_grad=True)
-    prepared, active_context = layer._prepare_mixer_state(value, context)
-    assert active_context is (context if wide else None)
-    layer._apply_mixer_update(layer.mixer(prepared.branch_input), prepared.state, active_context)
-    assert len(context.calls) == (2 + (not is_block_end) if wide else 0)
-    if wide:
-        assert context.calls[0] == "_compute_read"
-        if not is_block_end:
-            assert context.calls[-1] == "_compute_write"
+    prepared = layer._prepare_mixer_state(value)
+    layer._apply_mixer_update(layer.mixer(prepared.branch_input), prepared.state)
+    install_activation_strategies(stack, [])
+    expected = (["read", "norm"] + ([] if is_block_end else ["write"])) if wide else []
+    assert replayed == expected
 
 
 def test_wr_registration_and_legacy_load_are_unchanged():
     layer = _layer(True, True)
     before = [(name, id(param)) for name, param in layer.named_parameters()]
     expected = {name: value.detach().clone() for name, value in layer.state_dict().items()}
-    prepared, _ = layer._prepare_mixer_state(torch.randn(2, 1, 24))
+    prepared = layer._prepare_mixer_state(torch.randn(2, 1, 24))
     layer._apply_mixer_update(layer.mixer(prepared.branch_input), prepared.state)
     assert [(name, id(param)) for name, param in layer.named_parameters()] == before
     assert not isinstance(prepared, nn.Module)

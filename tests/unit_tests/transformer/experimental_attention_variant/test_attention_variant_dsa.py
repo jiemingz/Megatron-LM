@@ -9,6 +9,10 @@ import pytest
 import torch
 
 import megatron.core.parallel_state as parallel_state
+from megatron.core.activation_policy import (
+    LayerWiseCheckpointStrategy,
+    install_activation_strategies,
+)
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     _validate_dsa_index_share_pipeline_split,
     get_dsa_module_spec_for_backend,
@@ -16,7 +20,6 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.recompute import checkpointed_forward
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import dsa_indexer_loss, dsa_kernels
@@ -238,20 +241,34 @@ class TestDSAIndexShareHelpers:
                     length_holder[1] = hidden_states.detach().to(torch.int32)
                 return hidden_states
 
-        block = SimpleNamespace(
-            config=SimpleNamespace(
-                experimental_attention_variant="dsa",
-                dsa_indexer_topk_freq=4,
-                fp8=False,
-                fp4=False,
-                enable_mhc_connections=False,
-                distribute_saved_activations=False,
-                recompute_method=recompute_method,
-                recompute_num_layers=1,
-            ),
-            layers=[HolderLayer()],
-            num_layers_per_pipeline_rank=1,
-            pg_collection=SimpleNamespace(tp=None),
+        class Stack(torch.nn.Module):
+            """A layer stack whose full recompute is LayerWiseCheckpointStrategy's."""
+
+            def __init__(self):
+                super().__init__()
+                self.config = SimpleNamespace(
+                    experimental_attention_variant="dsa",
+                    dsa_indexer_topk_freq=4,
+                    fp8=False,
+                    fp4=False,
+                )
+                self.pg_collection = SimpleNamespace(tp=None)
+                self.__dict__["steps"] = [HolderLayer()]
+
+            def _run_layer(
+                self, index, hidden_states, context, *, attention_mask, packed_seq_params
+            ):
+                layer = self.steps[index]
+                return layer(hidden_states, attention_mask, packed_seq_params), context
+
+        stack = Stack()
+        install_activation_strategies(
+            stack,
+            [
+                LayerWiseCheckpointStrategy(
+                    stack._run_layer, stack.steps, method=recompute_method, recompute_num_layers=1
+                )
+            ],
         )
         checkpoint_calls = []
 
@@ -261,20 +278,17 @@ class TestDSAIndexShareHelpers:
                 return function(*args)
 
         monkeypatch.setattr(
-            "megatron.core.transformer.utils.tensor_parallel.checkpoint", fake_checkpoint
+            "megatron.core.activation_policy.recompute.checkpointing.checkpoint", fake_checkpoint
         )
         shared_attention_mask = torch.empty(1)
         for value in (1.0, 2.0):
-            checkpointed_forward(
-                block,
-                hidden_states=torch.tensor([value]),
+            # One forward of the one-layer stack.
+            stack._run_layer(
+                0,
+                torch.tensor([value]),
+                None,
                 attention_mask=shared_attention_mask,
-                context=None,
-                context_mask=None,
-                rotary_pos_emb=torch.empty(1),
-                attention_bias=None,
                 packed_seq_params=None,
-                use_inner_quantization_context=False,
             )
 
         for function, args in checkpoint_calls:

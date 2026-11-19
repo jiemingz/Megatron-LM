@@ -40,11 +40,9 @@ from megatron.core.utils import (
 if HAVE_TE:
     import transformer_engine as te
 
-    from megatron.core.extensions.transformer_engine import TELinear, set_save_original_input
     from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 else:
     te = None
-    TELinear, set_save_original_input = None, None
     get_cuda_rng_tracker = None
 
 
@@ -150,21 +148,9 @@ class SharedExpertMLP(MLP):
         else:
             self.gate_weight = None
 
-        if (
-            self.config.fp8
-            and self.config.fp8_recipe != 'delayed'
-            and is_te_min_version("2.6.0dev0")
-        ) or (self.config.fp4 and is_te_min_version("2.7.0.dev0")):
-            # For fp8/fp4 training, the output of pre_mlp_layernorm is saved by router, and
-            # the shared expert linear_fc1 also saves the quantized tensor of this output.
-            # Here we set the linear_fc1 to save the original input tensors to avoid the extra
-            # memory usage of the quantized tensor.
-            shared_experts_recompute = (
-                config.recompute_granularity == 'selective'
-                and "shared_experts" in config.recompute_modules
-            )
-            if not shared_experts_recompute and HAVE_TE and isinstance(self.linear_fc1, TELinear):
-                set_save_original_input(self.linear_fc1)
+        # Whether linear_fc1 saves its original (unquantized) input under FP8/FP4 depends on
+        # whether the shared experts are checkpointed; the owning MoELayer sets it when it builds
+        # its activation strategies (MoELayer.activation_strategies).
 
         if self.config.moe_shared_expert_overlap:
             # disable TP related AG/RS communications in the linear module

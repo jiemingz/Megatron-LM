@@ -9,6 +9,7 @@ import torch
 from packaging import version
 
 from megatron.core import mpu, parallel_state
+from megatron.core.activation_policy import CheckpointStrategy, has_strategy
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -315,7 +316,8 @@ class TestParallelTransformerBlock:
         )
         assert selective_transformer_block.config.recompute_granularity == 'selective'
         assert "core_attn" in selective_transformer_block.config.recompute_modules
-        assert selective_transformer_block.checkpoint_core_attention
+        self_attention = selective_transformer_block.layers[0].self_attention
+        assert has_strategy(self_attention, self_attention._run_core_attention, CheckpointStrategy)
         assert selective_transformer_block.config.fp8 == fp8
 
         sequence_length = 32

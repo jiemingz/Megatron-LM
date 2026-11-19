@@ -1538,6 +1538,11 @@ def _build_gpt_model_with_cuda_graph(
     model_parallel_cuda_manual_seed(seed)
     torch.manual_seed(seed)
     ConfigClass = MLATransformerConfig if is_mla else TransformerConfig
+    # Layernorm recompute with a captured MoE router needs the moe_preprocess graph with the
+    # alltoall dispatcher (TransformerConfig rejects it otherwise); this test uses allgather.
+    recompute_modules = [] if "moe_router" in (cuda_graph_scope or []) else ["layernorm"]
+    if num_experts is not None:
+        recompute_modules.append("moe_act")
     transformer_config = ConfigClass(
         num_layers=num_layers,
         hidden_size=hidden_size,
@@ -1547,7 +1552,7 @@ def _build_gpt_model_with_cuda_graph(
         qk_layernorm=not is_mla,
         bf16=True,
         # Recompute
-        recompute_modules=["layernorm", "moe_act"] if num_experts is not None else ["layernorm"],
+        recompute_modules=recompute_modules,
         recompute_granularity="selective",
         # MoE
         num_moe_experts=num_experts,
