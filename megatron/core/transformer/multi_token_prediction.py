@@ -1842,9 +1842,11 @@ class MultiTokenPredictionLayer(MegatronModule):
                     setattr(self.hc_head_fn, "sequence_parallel", True)
                     setattr(self.hc_head_base, "sequence_parallel", True)
                     setattr(self.hc_head_scale, "sequence_parallel", True)
-        # Activation strategies: under full recompute, legacy GPT MTP checkpoints its projection
-        # + transformer layer (point _proj_and_transformer_layer); hybrid MTP delegates full
-        # recompute to its nested HybridStack instead.
+
+    def activation_strategies(self) -> list:
+        """Activation strategies: under full recompute, legacy GPT MTP checkpoints its projection +
+        transformer layer (point _proj_and_transformer_layer); hybrid MTP delegates full recompute
+        to its nested HybridStack instead."""
         config = self.config
         activation_strategies = []
         if config.recompute_granularity == "full" and not self.is_hybrid_mtp:
@@ -1866,7 +1868,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                         delayed_fp8_context=True,
                     )
                 )
-        self.install_activation_strategies(activation_strategies)
+        return activation_strategies
 
     def get_inner_quantization_context(self) -> AbstractContextManager:
         """Return the quantization context for fine-grained MTP execution."""

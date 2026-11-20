@@ -487,14 +487,16 @@ class TEGroupedMLP(MegatronModule):
             self.quantization_unpadding = Fp8Unpadding(
                 self.num_local_experts, align_size=align_size
             )
-        # Activation strategies.
-        # Fused path: offload the whole TE op-fuser fc1 -> act -> fc2 call (point
-        # _fused_group_mlp) and release its input after the copy. moe_act recompute there is a
-        # construction argument of the TE activation op: there is no region boundary to act on.
-        # Unfused path: linear_fc1 -> _bias_activation -> linear_fc2. With both expert_fc1 and
-        # moe_act, fc1 and the activation offload as one fused_group_mlp group whose hooks close
-        # before fc2 and which commits after fc2, so fc1_output is reloaded before a moe_act
-        # recompute. With grouped-tensor experts, fc1 stays outside the group.
+
+    def activation_strategies(self) -> list:
+        """Activation strategies. Fused path: offload the whole TE op-fuser fc1 -> act -> fc2 call
+        (point _fused_group_mlp) and release its input after the copy. moe_act recompute there is a
+        construction argument of the TE activation op: there is no region boundary to act on.
+        Unfused path: linear_fc1 -> _bias_activation -> linear_fc2. With both expert_fc1 and
+        moe_act, fc1 and the activation offload as one fused_group_mlp group whose hooks close
+        before fc2 and which commits after fc2, so fc1_output is reloaded before a moe_act
+        recompute. With grouped-tensor experts, fc1 stays outside the group."""
+        config = self.config
         activation_strategies = []
         if self._with_fused_impl:
             if self.offload_fused_group_mlp:
@@ -554,7 +556,7 @@ class TEGroupedMLP(MegatronModule):
                         self._bias_activation, release_on=Event(self.linear_fc2, "exit")
                     )
                 )
-        self.install_activation_strategies(activation_strategies)
+        return activation_strategies
 
     def bind_virtual_experts(self, load_balancer) -> None:
         """Bind native and virtual runtime weights after main gradients are initialized."""

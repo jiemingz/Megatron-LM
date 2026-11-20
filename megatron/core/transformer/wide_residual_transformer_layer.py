@@ -128,10 +128,12 @@ class WideResidualTransformerLayer(TransformerLayer):
                     f"{connection.branch_hidden_size}."
                 )
 
-        # Activation strategies (replacing TransformerLayer's). A norm whose half has a residual
-        # connection is replayed with its residual-stream block (see get_residual_branches); it is
-        # then not offloaded and its output is kept out of other offload groups. Its offload
-        # group releases nothing, since the connection consumes the residual.
+    def activation_strategies(self) -> list:
+        """Replaces TransformerLayer's. A norm whose half has a residual connection is replayed
+        with its residual-stream block (see get_residual_branches); it is then not offloaded and
+        its output is kept out of other offload groups. Its offload group releases nothing, since
+        the connection consumes the residual."""
+        config = self.config
         stream_replay = config.residual_stream_replay()
         attn_connected = self.residual_read_self_attn is not None
         mlp_connected = self.residual_read_mlp is not None
@@ -178,7 +180,7 @@ class WideResidualTransformerLayer(TransformerLayer):
             )
         if config.recompute_selected("mlp") and not self.is_moe_layer:
             activation_strategies.append(CheckpointStrategy(self.mlp))
-        self.install_activation_strategies(activation_strategies)
+        return activation_strategies
 
     def get_residual_branches(self) -> list[ResidualBranch]:
         """The connected halves' residual read, norm and write (see ``ResidualReplayStrategy``)."""

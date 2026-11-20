@@ -299,10 +299,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         self.mhc_num_residual_streams = config.mhc_num_residual_streams
         # How the layer stack runs (full recompute, legacy TE CPU offloading, mHC replay) is
-        # decided by the activation strategies installed at the end of __init__.
+        # decided by its activation strategies (see activation_strategies).
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
-        # Activation strategies for the layer stack.
+
+    def activation_strategies(self) -> list:
+        """Activation strategies for the layer stack."""
+        config = self.config
         activation_strategies = []
         if config.recompute_granularity == "full":
             activation_strategies.append(
@@ -334,7 +337,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         unless_full_recompute=config.recompute_granularity == "full",
                     )
                 )
-        self.install_activation_strategies(activation_strategies)
+        return activation_strategies
 
     def _build_layers(self):
         # Transformer layers.

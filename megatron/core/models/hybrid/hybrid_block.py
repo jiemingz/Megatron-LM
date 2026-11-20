@@ -468,7 +468,10 @@ class HybridStack(MegatronModule):
             for is_custom, layer in zip(self._is_custom_layer, self.layers)
         ]
         self._takes_cp_layout_state = [isinstance(layer, ShortcutMoEBlock) for layer in self.layers]
-        # Activation strategies for the layer stack.
+
+    def activation_strategies(self) -> list:
+        """Activation strategies for the layer stack."""
+        config = self.config
         activation_strategies = []
         if config.recompute_granularity == "full":
             activation_strategies.append(
@@ -499,7 +502,7 @@ class HybridStack(MegatronModule):
                     atomic_pairs=self._residual_stream_atomic_layer_pairs,
                 )
             )
-        self.install_activation_strategies(activation_strategies)
+        return activation_strategies
 
     def _assert_submodule_configured(
         self, submodules: HybridStackSubmodules, attr_name: str

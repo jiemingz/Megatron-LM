@@ -538,19 +538,23 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             self.d_inner_local_cp = self.d_inner_local_tp
             self.nheads_local_cp = self.nheads_local_tp
             self.ngroups_local_cp = self.ngroups_local_tp
-        # Activation strategies (points, in forward order: _in_proj_preprocess, _prepare_qkv,
-        # _postprocess). qkv recompute releases on postprocess entry, so its rebuild hooks on
-        # core_attn_out. The gdp_qkv offload group commits on the mixer output; its backward
-        # waits for the reload before the qkv rebuild unpacks the saved conv input. in_proj
-        # recompute releases on the mixer output, so it rebuilds first in the mixer's backward.
-        config = self.config
-        recompute_in_proj = config.recompute_selected("gdp_in_proj")
-        offload_qkv = config.offload_selected("gdp_qkv")
-        if recompute_in_proj and offload_qkv:
+        if self.config.recompute_selected("gdp_in_proj") and self.config.offload_selected(
+            "gdp_qkv"
+        ):
             raise ValueError(
                 "gdp_qkv cannot be set in offload_modules together with gdp_in_proj in "
                 "recompute_modules."
             )
+
+    def activation_strategies(self) -> list:
+        """Points, in forward order: _in_proj_preprocess, _prepare_qkv, _postprocess. qkv recompute
+        releases on postprocess entry, so its rebuild hooks on core_attn_out. The gdp_qkv offload
+        group commits on the mixer output; its backward waits for the reload before the qkv
+        rebuild unpacks the saved conv input. in_proj recompute releases on the mixer output, so
+        it rebuilds first in the mixer's backward."""
+        config = self.config
+        recompute_in_proj = config.recompute_selected("gdp_in_proj")
+        offload_qkv = config.offload_selected("gdp_qkv")
         activation_strategies = []
         if recompute_in_proj:
             activation_strategies.append(
@@ -568,7 +572,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
                     self._prepare_qkv, release_on=Event(self._postprocess, "enter")
                 )
             )
-        self.install_activation_strategies(activation_strategies)
+        return activation_strategies
 
     def forward_pre_attn_and_core_attn(
         self,

@@ -272,16 +272,18 @@ class HyperConnectionModule(MegatronModule):
             self._proj_rms_compute_h_op = None
 
         self._init_weights()
-        # Activation strategies. The projection + RMS norm (_proj_rms) is always checkpointed: it
-        # keeps its activation-dtype input and upcasts inside, which avoids retaining an FP32 copy
-        # of the residual stream. Under mHC recompute the aggregation (aggregate, the read), the
-        # H_post expansion (_expand_h_post) and the H_res/H_post/BDA update (the write) are
-        # replayed with their block by the layer stack's residual replay (see the owning layer's
-        # get_residual_branches).
+
+    def activation_strategies(self) -> list:
+        """Activation strategies. The projection + RMS norm (_proj_rms) is always checkpointed: it
+        keeps its activation-dtype input and upcasts inside, which avoids retaining an FP32 copy of
+        the residual stream. Under mHC recompute the aggregation (aggregate, the read), the H_post
+        expansion (_expand_h_post) and the H_res/H_post/BDA update (the write) are replayed with
+        their block by the layer stack's residual replay (see the owning layer's
+        get_residual_branches)."""
         activation_strategies = [
             CheckpointStrategy(self._proj_rms, impl="non_reentrant", preserve_rng_state=False)
         ]
-        self.install_activation_strategies(activation_strategies)
+        return activation_strategies
 
     def _init_weights(self) -> None:
         """Initialize weights for stable training."""

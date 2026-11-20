@@ -456,8 +456,9 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
 
-        # Activation strategies (points: get_query_key_value_tensors, _run_core_attention,
-        # linear_proj).
+    def activation_strategies(self) -> list:
+        """Activation strategies (points: get_query_key_value_tensors, _run_core_attention,
+        linear_proj)."""
         config = self.config
         activation_strategies = []
         if config.offload_selected("qkv_linear"):
@@ -491,7 +492,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     self.linear_proj, "attn_proj", release=(TensorRef.input(self.linear_proj),)
                 )
             )
-        self.install_activation_strategies(activation_strategies)
+        return activation_strategies
 
     def _get_core_attention_extra_kwargs(
         self,

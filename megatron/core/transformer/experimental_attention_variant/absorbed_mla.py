@@ -450,8 +450,10 @@ class AbsorbedMLASelfAttention(Attention):
             config=self.config,
             eps=self.config.layernorm_epsilon,
         )
-        # Activation strategies (replacing Attention's; points: _qkv_up_proj_and_rope,
-        # core_attention, linear_proj). Absorbed MLA supports no activation offloading.
+
+    def activation_strategies(self) -> list:
+        """Activation strategies (replacing Attention's; points: _qkv_up_proj_and_rope,
+        core_attention, linear_proj). Absorbed MLA supports no activation offloading."""
         config = self.config
         activation_strategies = []
         if config.recompute_selected("core_attn"):
@@ -464,7 +466,7 @@ class AbsorbedMLASelfAttention(Attention):
                     self._qkv_up_proj_and_rope, release_on=Event(self.linear_proj, "enter")
                 )
             )
-        self.install_activation_strategies(activation_strategies)
+        return activation_strategies
 
     def get_query_key_value_tensors(
         self,

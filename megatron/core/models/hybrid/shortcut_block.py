@@ -227,11 +227,12 @@ class ShortcutMoEBlock(MegatronModule):
             else IdentityOp()
         )
         self.route_ready_event = torch.cuda.Event() if self.overlap_mode else None
-        # Activation strategies for the shortcut norms of the attention/MoE pair (_launch_combine
-        # is the routed-output combine). Under residual-stream recompute the
-        # shortcut read and both norms replay with their block (see
-        # get_residual_branches_by_layer); they are then not offloaded and their outputs are kept
-        # out of other offload groups.
+
+    def activation_strategies(self) -> list:
+        """The shortcut norms of the attention/MoE pair (_launch_combine is the routed-output
+        combine). Under residual-stream recompute the shortcut read and both norms replay with
+        their block (see get_residual_branches_by_layer); they are then not offloaded and their
+        outputs are kept out of other offload groups."""
         config = self.config
         exclude = config.residual_stream_replay() and config.fine_grained_activation_offloading
         activation_strategies = []
@@ -257,7 +258,7 @@ class ShortcutMoEBlock(MegatronModule):
             )
         if exclude:
             activation_strategies.append(ExcludeFromOffloadStrategy(self.shortcut_post_norm))
-        self.install_activation_strategies(activation_strategies)
+        return activation_strategies
 
     def setup_inference_overlap(self) -> None:
         """Create synchronization state and check stream ownership before graph capture.

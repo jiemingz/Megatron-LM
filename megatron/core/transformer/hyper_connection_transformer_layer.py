@@ -146,9 +146,10 @@ class HyperConnectionTransformerLayer(
         # mHC has always bypassed this legacy hook, which cannot carry residual state.
         self._legacy_forward_post_mlp = None
 
-        # Activation strategies (replacing TransformerLayer's). Under mHC recompute the norms
-        # replay with their block (see get_residual_branches); the mHC kernels consume the
-        # residual, so the norm offload groups release nothing.
+    def activation_strategies(self) -> list:
+        """Replaces TransformerLayer's. Under mHC recompute the norms replay with their block (see
+        get_residual_branches); the mHC kernels consume the residual, so the norm offload groups
+        release nothing."""
         config = self.config
         activation_strategies = []
         if config.recompute_selected("layernorm") and not is_identity(self.input_layernorm):
@@ -173,7 +174,7 @@ class HyperConnectionTransformerLayer(
             )
         if config.recompute_selected("mlp") and not self.is_moe_layer:
             activation_strategies.append(CheckpointStrategy(self.mlp))
-        self.install_activation_strategies(activation_strategies)
+        return activation_strategies
 
     def get_residual_branches(self) -> list[ResidualBranch]:
         """Each active half's mHC read (``aggregate``), its norm and H_post expansion, and its

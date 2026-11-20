@@ -25,7 +25,6 @@ from megatron.core.activation_policy import (
     Event,
     OffloadStrategy,
     TensorRef,
-    installed_strategies,
 )
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
@@ -550,9 +549,24 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
                 self._legacy_forward_post_mlp = klass._forward_post_mlp
                 break
 
-        # Activation strategies. The norms and the MLP are child-module points; the residual
-        # adds are the method points _self_attn_bda and _mlp_bda. mHC and wide-residual layers
-        # install their own (see their __init__).
+        if (config.fp8 or config.fp4) and config.recompute_selected("layernorm"):
+            # A recomputed norm's consumer saves the original norm output instead of its
+            # quantized copy.
+            if not is_identity(self.input_layernorm):
+                self.self_attention.set_for_recompute_input_layernorm()
+            if not is_identity(self.pre_mlp_layernorm):
+                if self.is_moe_layer:
+                    self.mlp.set_for_recompute_pre_mlp_layernorm()
+                else:
+                    from megatron.core.extensions.transformer_engine import set_save_original_input
+
+                    set_save_original_input(self.mlp.linear_fc1)
+        _set_offload_in_cuda_graph(self)
+
+    def activation_strategies(self) -> list:
+        """The norms and the MLP are child-module points; the residual adds are the method points
+        _self_attn_bda and _mlp_bda. mHC and wide-residual layers override this."""
+        config = self.config
         activation_strategies = []
         if config.recompute_selected("layernorm") and not is_identity(self.input_layernorm):
             # The norm output is released when the attention output reaches the residual add.
@@ -563,9 +577,6 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
                     retain_input_tensors=self._input_layernorm_returns_residual,
                 )
             )
-            if config.fp8 or config.fp4:
-                # Attention saves the original norm output instead of its quantized copy.
-                self.self_attention.set_for_recompute_input_layernorm()
         if config.recompute_selected("layernorm") and not is_identity(self.pre_mlp_layernorm):
             activation_strategies.append(
                 CheckpointWithoutOutputStrategy(
@@ -574,14 +585,6 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
                     retain_input_tensors=self._pre_mlp_layernorm_returns_residual,
                 )
             )
-            if config.fp8 or config.fp4:
-                # The MLP saves the original norm output instead of its quantized copy.
-                if self.is_moe_layer:
-                    self.mlp.set_for_recompute_pre_mlp_layernorm()
-                else:
-                    from megatron.core.extensions.transformer_engine import set_save_original_input
-
-                    set_save_original_input(self.mlp.linear_fc1)
         if config.offload_selected("attn_norm") and not is_identity(self.input_layernorm):
             # Commits after the residual add, which consumed the residual (its input 1).
             activation_strategies.append(
@@ -603,8 +606,7 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
             )
         if config.recompute_selected("mlp") and not self.is_moe_layer:
             activation_strategies.append(CheckpointStrategy(self.mlp))
-        _set_offload_in_cuda_graph(self)
-        self.install_activation_strategies(activation_strategies)
+        return activation_strategies
 
     def init_backward_dw_wrapper(self):
         """Initialize ``self.backward_dw_wrapper`` for delayed-wgrad scheduling.
@@ -1701,15 +1703,14 @@ class MoETransformerLayer(TransformerLayer):
 
         super().__init__(*args, **kwargs)
 
-        # The TransformerLayer strategies, plus: with cuda_graph_impl='local', moe recompute
-        # checkpoints the partial-graph chain (MoELayer then skips its own "moe" checkpoint), in
-        # eval too.
-        activation_strategies = [
-            strategy for group in installed_strategies(self).values() for strategy in group
-        ]
+    def activation_strategies(self) -> list:
+        """The TransformerLayer strategies, plus: with cuda_graph_impl='local', moe recompute
+        checkpoints the partial-graph chain (MoELayer then skips its own "moe" checkpoint), in
+        eval too."""
+        activation_strategies = super().activation_strategies()
         if self.config.recompute_selected("moe") and self.config.cuda_graph_impl == "local":
             activation_strategies.append(CheckpointStrategy(self._forward_mlp_partial_cudagraphs))
-        self.install_activation_strategies(activation_strategies)
+        return activation_strategies
 
     def _should_call_local_cudagraph(self, *args, **kwargs):
         """

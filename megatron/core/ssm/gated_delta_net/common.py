@@ -398,10 +398,12 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         self._chunkwise_cp_context_cache: dict[tuple[int, int], tuple[torch.Tensor, object]] = {}
 
         self.reset_parameters()
-        # Activation strategies (points: ``_gdn_forward``, the whole layer;
-        # ``_gated_norm_and_a2a``, the gated output norm and its layout restore; ``out_proj``,
-        # the output projection). Every variant implements these points. The config rejects
-        # these recomputes together with the two-stage (shortcut) path.
+
+    def activation_strategies(self) -> list:
+        """Activation strategies (points: ``_gdn_forward``, the whole layer;
+        ``_gated_norm_and_a2a``, the gated output norm and its layout restore; ``out_proj``, the
+        output projection). Every variant implements these points. The config rejects these
+        recomputes together with the two-stage (shortcut) path."""
         config = self.config
         activation_strategies = []
         if config.recompute_selected("gdn_norm_out"):
@@ -424,7 +426,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
                     distribute_saved_activations=config.distribute_saved_activations,
                 )
             )
-        self.install_activation_strategies(activation_strategies)
+        return activation_strategies
 
     def supports_two_stage_attention(self) -> bool:
         """GDN variants support the two-stage path.

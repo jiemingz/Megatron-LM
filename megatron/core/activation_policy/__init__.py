@@ -1,12 +1,12 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Activation memory strategies (recompute, replay, checkpoint, offload) applied at points.
 
-Each module builds its :mod:`.strategies` in ``__init__`` from its config
-(``TransformerConfig.recompute_selected`` / ``offload_selected``) and installs them with
-``MegatronModule.install_activation_strategies``. A strategy acts on a *point*: a child module or
-a method of its owner, hooked transparently by ``megatron.core.transformer.module``; model code
-just calls its submodules and methods. Layer stacks install the strategies that span layers (full
-recompute, residual replay), which hook their layers' points.
+Each module returns its :mod:`.strategies` from ``MegatronModule.activation_strategies``, built
+from its config (``TransformerConfig.recompute_selected`` / ``offload_selected``); they are
+installed once the module is constructed. A strategy acts on a *point*: a child module or a method
+of its owner, hooked transparently by ``megatron.core.transformer.module``; model code just calls
+its submodules and methods. Layer stacks return the strategies that span layers (full recompute,
+residual replay), which hook their layers' points.
 
 The mechanisms behind the strategies live in two subpackages: :mod:`.recompute` (checkpointing,
 output-discarding recompute and block replay) and :mod:`.offload` (fine-grained activation

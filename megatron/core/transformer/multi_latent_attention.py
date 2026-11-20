@@ -431,9 +431,11 @@ class MultiLatentAttention(Attention):
             # linear_proj to save the original input tensors to avoid the extra memory usage of
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
-        # Activation strategies (replacing Attention's; points: _qkv_linear_region (down
-        # projections), _qkv_up_proj_and_rope (Q/KV up projections and RoPE, nested in
-        # _qkv_linear_region), _run_core_attention, linear_proj).
+
+    def activation_strategies(self) -> list:
+        """Activation strategies (replacing Attention's; points: _qkv_linear_region (down
+        projections), _qkv_up_proj_and_rope (Q/KV up projections and RoPE, nested in
+        _qkv_linear_region), _run_core_attention, linear_proj)."""
         config = self.config
         activation_strategies = []
         if config.offload_selected("qkv_linear"):
@@ -479,7 +481,7 @@ class MultiLatentAttention(Attention):
                     self._qkv_up_proj_and_rope, release_on=Event(self.linear_proj, "enter")
                 )
             )
-        self.install_activation_strategies(activation_strategies)
+        return activation_strategies
 
     def _run_core_attention(
         self,

@@ -1,9 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""Every module with activation strategies builds and installs them in its own ``__init__``.
+"""Every module with activation strategies builds them in ``activation_strategies``.
 
-Installing replaces the strategies installed before, so a subclass whose strategies differ from
-its base class's (mHC and wide-residual layers, MLA variants, MoE layers) installs again at the
-end of its own ``__init__``; otherwise its instances silently keep the base class's strategies.
+Construction installs ``activation_strategies()`` once the module is fully built, so a subclass
+whose strategies differ from its base class's (mHC and wide-residual layers, MLA variants, MoE
+layers) overrides the method instead of installing again.
 """
 
 import importlib
@@ -11,9 +11,11 @@ import inspect
 
 import pytest
 
+from megatron.core.transformer.module import MegatronModule
+
 # (module, class) of every class that installs activation strategies.
 _OWNERS = [
-    ("megatron.core.transformer.transformer_layer", "_TransformerLayer"),
+    ("megatron.core.transformer.transformer_layer", "TransformerLayer"),
     ("megatron.core.transformer.transformer_layer", "MoETransformerLayer"),
     ("megatron.core.transformer.wide_residual_transformer_layer", "WideResidualTransformerLayer"),
     (
@@ -48,9 +50,19 @@ def _cls(module, name):
     return getattr(importlib.import_module(module), name)
 
 
+# Owners that are not Megatron modules install explicitly at the end of ``__init__``.
+_EXPLICIT_INSTALL = {"TransformerEncoder", "RopeTransformerEncoder"}
+
+
 @pytest.mark.parametrize("module,name", _OWNERS, ids=[name for _, name in _OWNERS])
-def test_owner_installs_in_its_own_init(module, name):
+def test_owner_defines_its_strategies(module, name):
     cls = _cls(module, name)
-    assert "__init__" in vars(cls), f"{name} must define __init__ to install its strategies"
-    source = inspect.getsource(vars(cls)["__init__"])
-    assert "install_activation_strategies" in source, f"{name}.__init__ does not install"
+    if name in _EXPLICIT_INSTALL:
+        source = inspect.getsource(vars(cls)["__init__"])
+        assert "install_activation_strategies" in source, f"{name}.__init__ does not install"
+        return
+    method = cls.activation_strategies
+    assert method is not MegatronModule.activation_strategies, f"{name} defines no strategies"
+    assert "install_activation_strategies" not in inspect.getsource(
+        vars(cls).get("__init__", lambda: None)
+    ), f"{name}.__init__ installs strategies itself"

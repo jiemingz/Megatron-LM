@@ -3,8 +3,10 @@
 """Megatron Module."""
 
 import copy
+import functools
 import inspect
 import weakref
+from abc import ABCMeta
 from contextlib import nullcontext
 from typing import Any, Optional, Tuple
 
@@ -66,7 +68,48 @@ def is_first_microbatch_tracked(config) -> bool:
     )
 
 
-class MegatronModule(torch.nn.Module):
+# The classes whose own ``__init__`` completed for a module (see _MegatronModuleMeta).
+_COMPLETED_INITS_ATTR = "_megatron_completed_inits"
+
+
+class _MegatronModuleMeta(ABCMeta):
+    """Installs a module's activation strategies once it is fully constructed.
+
+    The install runs after the most-derived ``__init__`` returned (every subclass has built its
+    submodules), so a subclass only overrides :meth:`MegatronModule.activation_strategies`. It
+    only runs if the constructor that builds the strategies' points ran: the ``__init__`` of the
+    class that defines the ``activation_strategies`` in use. A subclass that bypasses that
+    constructor (a stand-in that builds only part of the module) gets no strategies.
+    Derives from ``ABCMeta`` so that Megatron modules can also be abstract base classes.
+    """
+
+    def __call__(cls, *args, **kwargs):
+        module = super().__call__(*args, **kwargs)
+        if _strategy_constructor(cls) in module.__dict__.get(_COMPLETED_INITS_ATTR, ()):
+            strategies = list(module.activation_strategies())
+            if strategies:
+                module.install_activation_strategies(strategies)
+        module.__dict__.pop(_COMPLETED_INITS_ATTR, None)
+        return module
+
+
+def _strategy_constructor(cls) -> type:
+    """The class whose ``__init__`` builds what ``cls.activation_strategies`` refers to: the first
+    class defining ``__init__`` in the MRO of the class that defines the method."""
+    owner = next(klass for klass in cls.__mro__ if "activation_strategies" in vars(klass))
+    return next(klass for klass in owner.__mro__ if "__init__" in vars(klass))
+
+
+def _record_completed_init(cls, init):
+    @functools.wraps(init)
+    def __init__(self, *args, **kwargs):
+        init(self, *args, **kwargs)
+        self.__dict__.setdefault(_COMPLETED_INITS_ATTR, set()).add(cls)
+
+    return __init__
+
+
+class MegatronModule(torch.nn.Module, metaclass=_MegatronModuleMeta):
     """Base Megatron module inhertied by all Models.
 
     Megatron specific extensions of torch Module with support
@@ -80,6 +123,13 @@ class MegatronModule(torch.nn.Module):
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.config = config
+        self.__dict__.setdefault(_COMPLETED_INITS_ATTR, set()).add(MegatronModule)
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        # Record when this class's own constructor completes (see _MegatronModuleMeta).
+        if "__init__" in vars(cls):
+            cls.__init__ = _record_completed_init(cls, vars(cls)["__init__"])
 
     @classmethod
     def estimate_flops(
@@ -102,15 +152,24 @@ class MegatronModule(torch.nn.Module):
             f"{cls.__name__} must implement estimate_flops for layer FLOP accounting."
         )
 
-    def install_activation_strategies(self, strategies=()) -> None:
-        """Install activation strategies on this module, replacing any installed before.
+    def activation_strategies(self) -> list:
+        """This module's activation strategies (``megatron.core.activation_policy.strategies``),
+        built from its config.
 
-        Modules build their strategies (``megatron.core.activation_policy.strategies``) at the
-        end of ``__init__`` and install them here. A strategy acts on a *point*: a child module
-        (``self.linear_fc1``) or a method (``self._mlp_bda``). The point is hooked transparently
-        (see :class:`_ActivationPointHook`): callers keep calling the same module or method. A
-        subclass whose strategies differ installs again at the end of its own ``__init__``,
-        replacing the base class's.
+        Called once, when the module is fully constructed (see :class:`_MegatronModuleMeta`); the
+        strategies are then installed. A strategy acts on a *point*: a child module
+        (``self.linear_fc1``) or a method (``self._mlp_bda``), hooked transparently (see
+        :class:`_ActivationPointHook`): callers keep calling the same module or method.
+        Subclasses override this, calling ``super().activation_strategies()`` to extend the base
+        class's list. None by default.
+        """
+        return []
+
+    def install_activation_strategies(self, strategies=()) -> None:
+        """Install ``strategies`` on this module, replacing any installed before.
+
+        Construction installs :meth:`activation_strategies`; call this only to replace them
+        afterwards (for example in tests).
         """
         from megatron.core.activation_policy.runtime import install_activation_strategies
 

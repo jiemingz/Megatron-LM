@@ -1,8 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Activation strategies: what happens to a region's activations, one class per technique.
 
-A module builds its strategies in ``__init__`` from its config, each naming the region it acts on,
-and installs them with ``install_activation_strategies``.
+A module returns its strategies from ``MegatronModule.activation_strategies``, built from its config,
+each naming the region it acts on; they are installed once the module is constructed.
 
 The runtime knows nothing about recompute or offloading. For every call of a region it:
 

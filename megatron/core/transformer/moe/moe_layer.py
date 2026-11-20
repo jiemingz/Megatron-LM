@@ -525,8 +525,17 @@ class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
 
         # Setup events and streams for delayed wgrad computation.
         self.setup_delayed_wgrad_for_dispatch_backward_overlap()
-        # Activation strategies (points: _moe_forward / _megakernel_forward, the routed or
-        # megakernel forward; shared_experts, the shared-expert module).
+
+        shared_experts = getattr(self, "shared_experts", None)
+        # Decided on the shared experts' own (deep-copied) config, as SharedExpertMLP did.
+        if shared_experts is not None and not shared_experts.config.recompute_selected(
+            "shared_experts"
+        ):
+            _shared_experts_save_original_input(shared_experts)
+
+    def activation_strategies(self) -> list:
+        """Activation strategies (points: _moe_forward / _megakernel_forward, the routed or
+        megakernel forward; shared_experts, the shared-expert module)."""
         config = self.config
         activation_strategies = []
         if config.moe_calls_rerun_in_backward():
@@ -541,12 +550,7 @@ class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
         shared_experts = getattr(self, "shared_experts", None)
         if config.recompute_selected("shared_experts") and shared_experts is not None:
             activation_strategies.append(CheckpointStrategy(shared_experts))
-        # Decided on the shared experts' own (deep-copied) config, as SharedExpertMLP did.
-        if shared_experts is not None and not shared_experts.config.recompute_selected(
-            "shared_experts"
-        ):
-            _shared_experts_save_original_input(shared_experts)
-        self.install_activation_strategies(activation_strategies)
+        return activation_strategies
 
     def _setup_inference_mode(self, pg_collection):
         """Set up inference-optimized token dispatcher.

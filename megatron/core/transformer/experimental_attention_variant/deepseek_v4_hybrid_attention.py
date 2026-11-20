@@ -244,10 +244,6 @@ class DSv4HybridAttention(Attention):
             # linear_proj to save the original input tensors to avoid the extra memory usage of
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
-        # Activation strategies (replacing Attention's; points: _qkv_up_proj_and_rope,
-        # _run_dsv4_core_attention with inputs ``query, key, value, boundary_kv, ...``,
-        # _output_rope_and_group_proj (inverse output RoPE and grouped output projection),
-        # linear_proj).
         config = self.config
         assert not config.recompute_selected(
             "core_attn"
@@ -255,6 +251,12 @@ class DSv4HybridAttention(Attention):
         assert not config.offload_selected(
             "qkv_linear"
         ), "Offload qkv linear is not supported in DSv4 Hybrid Attention."
+
+    def activation_strategies(self) -> list:
+        """Replaces Attention's; points: _qkv_up_proj_and_rope, _run_dsv4_core_attention with
+        inputs ``query, key, value, boundary_kv, ...``, _output_rope_and_group_proj (inverse output
+        RoPE and grouped output projection), linear_proj."""
+        config = self.config
         activation_strategies = []
         if config.offload_selected("core_attn"):
             # Also releases the CP boundary K/V (input 3) when there is one.
@@ -283,7 +285,7 @@ class DSv4HybridAttention(Attention):
                     release_on=Event(self._output_rope_and_group_proj, "enter"),
                 )
             )
-        self.install_activation_strategies(activation_strategies)
+        return activation_strategies
 
     def forward(
         self,
