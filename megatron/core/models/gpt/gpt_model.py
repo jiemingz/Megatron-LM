@@ -9,9 +9,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
-from megatron.core.activation_policy.offload.session import (
-    prepare_model_chunk as prepare_offload_model_chunk,
-)
+from megatron.core.activation_policy.strategies import OffloadChunkStrategy
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import TELMHeadColumnParallelLinear
@@ -552,9 +550,12 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
 
         return preproc_output
 
-    def preprocess_for_fine_grained_offloading(self):
-        """Preprocess for fine-grained activation offloading."""
-        prepare_offload_model_chunk(self)
+    def activation_strategies(self) -> list:
+        """Fine-grained activation offloading registers the chunk on each forward or
+        schedule-plan build."""
+        if not self.config.fine_grained_activation_offloading:
+            return []
+        return [OffloadChunkStrategy(self.forward), OffloadChunkStrategy(self.build_schedule_plan)]
 
     def preprocess_for_paged_stash(self):
         """Preprocess for paged stash."""
@@ -634,9 +635,6 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             output_processor_context (Any, optional): User-defined context object forwarded to
                 `output_processor`.
         """
-        if self.config.fine_grained_activation_offloading:
-            self.preprocess_for_fine_grained_offloading()
-
         if self.config.moe_paged_stash:
             self.preprocess_for_paged_stash()
 
@@ -973,8 +971,6 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             TransformerModelChunkSchedulePlan: The model chunk schedule plan.
         """
 
-        if self.config.fine_grained_activation_offloading:
-            self.preprocess_for_fine_grained_offloading()
         if self.config.moe_paged_stash:
             self.preprocess_for_paged_stash()
 

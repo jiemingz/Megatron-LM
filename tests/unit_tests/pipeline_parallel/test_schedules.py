@@ -51,17 +51,19 @@ def test_reset_activation_offload_uses_language_model_group(mocker):
         },
         language_model_module_name="llm",
     )
-    session.end_iteration(config, collection)
+    session.end_offload_iteration(config, collection)
     reset.assert_called_once_with(process_group=language_group)
 
     reset.reset_mock()
     collection = MultiModuleProcessGroupCollection(
         module_pgs={"encoder_1": object(), "encoder_2": object()}
     )
-    session.end_iteration(config, collection)
+    session.end_offload_iteration(config, collection)
     reset.assert_not_called()
 
-    session.end_iteration(SimpleNamespace(fine_grained_activation_offloading=False), collection)
+    session.end_offload_iteration(
+        SimpleNamespace(fine_grained_activation_offloading=False), collection
+    )
     reset.assert_not_called()
 
 

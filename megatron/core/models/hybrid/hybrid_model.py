@@ -8,9 +8,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
-from megatron.core.activation_policy.offload.session import (
-    prepare_model_chunk as prepare_offload_model_chunk,
-)
+from megatron.core.activation_policy.strategies import OffloadChunkStrategy
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.context_parallel import ContextParallelBatch
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -628,9 +626,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
         self.decoder.set_input_tensor(input_tensor[0])
 
-    def preprocess_for_fine_grained_offloading(self):
-        """Preprocess for fine-grained activation offloading."""
-        prepare_offload_model_chunk(self)
+    def activation_strategies(self) -> list:
+        """Fine-grained activation offloading registers the chunk on each forward."""
+        if not self.config.fine_grained_activation_offloading:
+            return []
+        return [OffloadChunkStrategy(self.forward)]
 
     def preprocess_for_paged_stash(self):
         """Preprocess for paged stash."""
@@ -716,9 +716,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
-
-        if self.config.fine_grained_activation_offloading:
-            self.preprocess_for_fine_grained_offloading()
 
         if self.config.moe_paged_stash:
             self.preprocess_for_paged_stash()

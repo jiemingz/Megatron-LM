@@ -912,6 +912,45 @@ class ExcludeFromOffloadStrategy(Strategy):
         return out
 
 
+class OffloadChunkStrategy(Strategy):
+    """Fine-grained offloading of one model chunk: a call of its region (the chunk's forward or
+    schedule-plan build) first registers the chunk with the offload manager.
+
+    On the first call, the chunk's parameters (decoder, MTP and output layer) are marked as not
+    offloadable: only activations are offloaded.
+    """
+
+    __slots__ = ()
+    _PARAMS_EXCLUDED_ATTR = "_activation_offload_params_excluded"
+
+    def enter(self, call: RegionCall, args: tuple, kwargs: dict) -> tuple:
+        model = call.owner
+        config = model.config
+        interface = _offload_interface()
+        interface.init_chunk_handler(
+            pp_rank=model.pg_collection.pp.rank(),
+            vp_size=config.virtual_pipeline_model_parallel_size,
+            vp_stage=model.vp_stage,
+            min_offloaded_tensor_size=config.min_offloaded_tensor_size,
+            delta_offload_bytes_across_pp_ranks=config.delta_offload_bytes_across_pp_ranks,
+            activation_offload_fraction=config.activation_offload_fraction,
+            max_inflight_offloads=config.fine_grained_offloading_max_inflight_offloads,
+            buffer_size_gib=config.fine_grained_offloading_buffer_size_gib,
+        )
+        if model.__dict__.get(self._PARAMS_EXCLUDED_ATTR, False):
+            return args
+        modules = [model.decoder]
+        if model.mtp_process:
+            modules.append(model.mtp)
+        if model.post_process:
+            modules.append(model.output_layer)
+        for module in modules:
+            for param in module.parameters():
+                interface.mark_not_offload(param)
+        model.__dict__[self._PARAMS_EXCLUDED_ATTR] = True
+        return args
+
+
 # ---------------------------------------------------------------------------------------------
 # Installing
 # ---------------------------------------------------------------------------------------------

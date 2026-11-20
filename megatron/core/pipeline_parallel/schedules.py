@@ -9,9 +9,7 @@ import torch
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
-from megatron.core.activation_policy.offload.session import (
-    end_iteration as end_activation_offload_iteration,
-)
+from megatron.core.activation_policy.offload.session import end_offload_iteration
 from megatron.core.extensions.te_cuda_graphs import set_te_cuda_graph_current_microbatch
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
@@ -854,7 +852,7 @@ def forward_backward_no_pipelining(
             force_all_reduce=force_all_reduce,
         )
 
-    end_activation_offload_iteration(config, pg_collection)
+    end_offload_iteration(config, pg_collection)
     # Reset all_gather_pipeline bucket status before next validation iteration
     if forward_only:
         for model_chunk in [model]:
@@ -2079,7 +2077,7 @@ def forward_backward_pipelining_with_interleaving(
             force_all_reduce=force_all_reduce,
         )
 
-    end_activation_offload_iteration(config, pg_collection)
+    end_offload_iteration(config, pg_collection)
     # Restore config.grad_sync_func and config.param_sync_func.
     if forward_only:
         config.grad_sync_func, config.param_sync_func = grad_sync_func, param_sync_func
@@ -2521,7 +2519,7 @@ def forward_backward_pipelining_without_interleaving(
             force_all_reduce=force_all_reduce,
         )
 
-    end_activation_offload_iteration(config, pg_collection)
+    end_offload_iteration(config, pg_collection)
 
     if config.timers is not None:
         config.timers('forward-backward').stop()

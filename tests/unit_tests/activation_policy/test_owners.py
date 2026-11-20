@@ -41,6 +41,8 @@ _OWNERS = [
     ("megatron.core.transformer.multi_token_prediction", "MultiTokenPredictionLayer"),
     ("megatron.core.transformer.transformer_block", "TransformerBlock"),
     ("megatron.core.models.hybrid.hybrid_block", "HybridStack"),
+    ("megatron.core.models.gpt.gpt_model", "GPTModel"),
+    ("megatron.core.models.hybrid.hybrid_model", "HybridModel"),
     ("megatron.core.models.audio.nemo_transformer_encoder", "TransformerEncoder"),
     ("megatron.core.models.audio.nemo_rope_transformer_encoder", "RopeTransformerEncoder"),
 ]
