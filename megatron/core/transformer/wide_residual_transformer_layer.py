@@ -5,8 +5,10 @@ from __future__ import annotations
 
 from typing import Optional
 
+from megatron.core.activation_policy import ReplayRegion, ResidualBranch
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.identity_op import is_identity
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.wide_residual import (
@@ -116,6 +118,38 @@ class WideResidualTransformerLayer(TransformerLayer):
                     f"hidden_size={self.config.hidden_size}, got "
                     f"{connection.branch_hidden_size}."
                 )
+
+    def _connected_norms_replayed(self) -> bool:
+        """Residual-stream recompute replays the connected norms (see get_residual_branches)."""
+        return self.config.residual_stream_replay()
+
+    def get_residual_branches(self) -> list[ResidualBranch]:
+        """The connected halves' residual read, norm and write (see ``ResidualReplayStrategy``)."""
+        branches = []
+        for get_connection, norm, norm_returns_residual in (
+            (
+                self._get_residual_connection_for_self_attention,
+                self.input_layernorm,
+                self._input_layernorm_returns_residual,
+            ),
+            (
+                self._get_residual_connection_for_mlp,
+                self.pre_mlp_layernorm,
+                self._pre_mlp_layernorm_returns_residual,
+            ),
+        ):
+            read, write = get_connection("read"), get_connection("write")
+            if read is None:
+                continue
+            ops = () if is_identity(norm) else (ReplayRegion(self, norm, norm_returns_residual),)
+            branches.append(
+                ResidualBranch(
+                    read=ReplayRegion(read, read._compute_read),
+                    ops=ops,
+                    write=ReplayRegion(write, write._compute_write) if write is not None else None,
+                )
+            )
+        return branches
 
     def sharded_state_dict(
         self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None

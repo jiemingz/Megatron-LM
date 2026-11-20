@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
+from megatron.core.activation_policy import CheckpointStrategy, has_strategy
 from megatron.core.fusions import fused_gated_norm as gated_norm
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_experimental_attention_variant_module_spec,
@@ -102,7 +103,7 @@ def _model(pre_fusion, recompute=False, **overrides):
     return model.cuda().to(config.params_dtype)
 
 
-def test_gdn_recompute_disables_two_stage_attention(model_parallel):
+def test_gdn_recompute_installs_checkpoint(model_parallel):
     config = _config(recompute_granularity="selective", recompute_modules=["gdn"])
     spec = get_experimental_attention_variant_module_spec(config=config)
     groups = ProcessGroupCollection(
@@ -112,8 +113,9 @@ def test_gdn_recompute_disables_two_stage_attention(model_parallel):
     model = spec.module(
         config, submodules=spec.submodules, layer_number=1, pg_collection=groups
     ).cuda()
-    assert model.recompute_gdn
-    assert not model.supports_two_stage_attention()
+    assert has_strategy(model, model._gdn_forward, CheckpointStrategy)
+    # The config rejects gdn recompute together with the two-stage (shortcut) path.
+    assert model.supports_two_stage_attention()
 
 
 def _inputs(packed):
@@ -170,7 +172,7 @@ def test_post_fusion_module_parity(model_parallel, packed, recompute, pre_fusion
         actual, grads = _run(model, hidden, dy, metadata)
         assert norm.call_count == (2 if recompute else 1)
         assert check.call_count == norm.call_count
-    assert model.supports_two_stage_attention() == (not recompute)
+    assert model.supports_two_stage_attention()
     _assert_close(actual, expected, grads, reference_grads)
 
 

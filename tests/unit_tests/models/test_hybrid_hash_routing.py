@@ -6,7 +6,6 @@ from unittest import mock
 import pytest
 import torch
 
-from megatron.core import tensor_parallel
 from megatron.core.context_parallel.utils import ContextParallelBatch
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_allocation import PipelineSplit
@@ -37,7 +36,7 @@ class RecordingTransformerLayer(TransformerLayer):
     def __init__(self, layer_number=1, cuda_graph_impl="none", is_hash_layer=True):
         torch.nn.Module.__init__(self)
         self.layer_number = layer_number
-        self.config = SimpleNamespace(cuda_graph_impl=cuda_graph_impl)
+        self.config = SimpleNamespace(cuda_graph_impl=cuda_graph_impl, fp8=None, fp4=None)
         self.mlp = SimpleNamespace(router=SimpleNamespace(is_hash_layer=is_hash_layer))
         self.calls = []
         self.used_cuda_graph = False
@@ -67,16 +66,17 @@ class RecordingHashMlpTransformerLayer(TransformerLayer):
         torch.nn.Module.__init__(self)
         self.layer_number = 1
         self.config = SimpleNamespace(
-            bias_dropout_fusion=False, cuda_graph_impl="none", inference_fuse_tp_communication=False
+            bias_dropout_fusion=False,
+            cuda_graph_impl="none",
+            inference_fuse_tp_communication=False,
+            fp8=None,
+            fp4=None,
         )
         self.self_attention = IdentityOp()
         self.cross_attention = IdentityOp()
         self.mlp = torch.nn.Identity()
         self.mlp.router = SimpleNamespace(is_hash_layer=True)
-        self.mlp_norm_manager = None
         self.hidden_dropout = 0.0
-        self.recompute_pre_mlp_layernorm = False
-        self.mhc_checkpoint_pre_mlp_layernorm = False
         self.calls = []
 
     def _forward_mlp_output_with_bias(
@@ -86,7 +86,6 @@ class RecordingHashMlpTransformerLayer(TransformerLayer):
         padding_mask=None,
         packed_seq_params=None,
         input_ids=None,
-        mhc_recompute_manager=None,
     ):
         self.calls.append(
             {
@@ -94,14 +93,14 @@ class RecordingHashMlpTransformerLayer(TransformerLayer):
                 'padding_mask': padding_mask,
                 'packed_seq_params': packed_seq_params,
                 'input_ids': input_ids,
-                'mhc_recompute_manager': mhc_recompute_manager,
             }
         )
         return (torch.zeros_like(hidden_states), None), hidden_states
 
 
 class RecordingNonTransformerLayer(torch.nn.Module):
-    """Mamba-like layer whose signature deliberately excludes input_ids."""
+    """Mamba-like layer whose signature deliberately excludes input_ids (it accepts the rest of
+    the stack's shared layer arguments, as MambaLayer does)."""
 
     def __init__(self, layer_number=2):
         super().__init__()
@@ -116,6 +115,8 @@ class RecordingNonTransformerLayer(torch.nn.Module):
         rotary_pos_emb=None,
         *,
         packed_seq_params=None,
+        sequence_len_offset=None,
+        padding_mask=None,
     ):
         self.num_calls += 1
         return hidden_states
@@ -230,8 +231,7 @@ def test_hybrid_stack_omits_input_ids_keyword_when_not_provided():
 
 def test_hybrid_stack_full_recompute_preserves_ids_and_non_transformer_signature(monkeypatch):
     monkeypatch.setattr(
-        tensor_parallel,
-        "checkpoint",
+        "megatron.core.activation_policy.recompute.checkpointing.checkpoint",
         lambda function, _distribute_saved_activations, *args: function(*args),
     )
     transformer_layer = RecordingTransformerLayer()
@@ -252,38 +252,39 @@ def test_hybrid_stack_full_recompute_preserves_ids_and_non_transformer_signature
     assert non_transformer_layer.num_calls == 1
 
 
-def test_hybrid_mhc_wrapper_passes_ids_and_recompute_manager_to_mlp_branch():
+def test_hybrid_mhc_wrapper_passes_ids_to_mlp_branch():
     inner_layer = RecordingHashMlpTransformerLayer()
     wrapped_layer = wrap_with_passthrough_mhc(inner_layer)
-    manager = SimpleNamespace(is_last_layer_in_recompute_block=False)
     hidden_states = torch.randn(4, 2, 8, requires_grad=True)
     input_ids = torch.arange(8).reshape(2, 4)
 
-    output, _ = wrapped_layer(
-        hidden_states, attention_mask=None, mhc_recompute_manager=manager, input_ids=input_ids
-    )
+    output, _ = wrapped_layer(hidden_states, attention_mask=None, input_ids=input_ids)
 
     assert output.shape == hidden_states.shape
     assert inner_layer.calls[0]['input_ids'] is input_ids
-    assert inner_layer.calls[0]['mhc_recompute_manager'] is manager
 
 
-def test_hybrid_mhc_wrapper_discards_managed_pre_mlp_norm_checkpoint():
+def test_hybrid_mhc_wrapper_signals_inner_layer_mlp_bda_boundary(monkeypatch):
+    """The wrapper owns the residual add, so it marks the inner layer's mlp_bda boundary."""
+    signals = []
     inner_layer = RecordingHashMlpTransformerLayer()
-    inner_layer.mhc_checkpoint_pre_mlp_layernorm = True
-    inner_layer.pre_mlp_norm_checkpoint = mock.MagicMock()
+
+    def fake_fire_activation_boundary(point, when, value, *, inputs=()):
+        if when == "exit":
+            signals.append((point, inputs))
+            return value
+        return None
+
+    monkeypatch.setattr(inner_layer, "fire_activation_boundary", fake_fire_activation_boundary)
     wrapped_layer = wrap_with_passthrough_mhc(inner_layer)
-    manager = SimpleNamespace(is_last_layer_in_recompute_block=False)
     hidden_states = torch.randn(4, 2, 8, requires_grad=True)
 
-    wrapped_layer(
-        hidden_states,
-        attention_mask=None,
-        mhc_recompute_manager=manager,
-        input_ids=torch.arange(8).reshape(2, 4),
-    )
+    wrapped_layer(hidden_states, attention_mask=None, input_ids=torch.arange(8).reshape(2, 4))
 
-    inner_layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute.assert_called_once()
+    assert len(signals) == 1
+    point, inputs = signals[0]
+    assert point == inner_layer._mlp_bda
+    assert len(inputs) == 2  # (branch output with bias, residual)
 
 
 @pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine"])
@@ -546,6 +547,7 @@ def test_chunked_hash_moe_keeps_ids_and_padding_aligned():
             mlp_chunks_for_training=2,
             transformer_impl="local",
             inference_fuse_tp_communication=False,
+            moe_calls_rerun_in_backward=lambda: False,
         ),
         training=True,
         mlp=moe,

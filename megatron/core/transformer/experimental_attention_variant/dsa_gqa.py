@@ -145,13 +145,6 @@ def _simplified_indexer_uses_main_input_norm(config: TransformerConfig) -> bool:
     return getattr(config, "dsa_indexer_mode", "standard") == "simplified"
 
 
-def _dsa_recomputes(config, module: str) -> bool:
-    """Whether the shared activation-recompute policy asks for ``module`` to be recomputed."""
-    if getattr(config, "recompute_granularity", None) != "selective":
-        return False
-    return module in (getattr(config, "recompute_modules", None) or ())
-
-
 def _dsa_caches_routing(config) -> bool:
     """Whether the min-memory DSA kernels save the forward routing top-k for the backward pass.
 
@@ -162,7 +155,7 @@ def _dsa_caches_routing(config) -> bool:
     if getattr(config, "dsa_fwd_use_dense_attn", False):
         # Dense indexer warmup bypasses routing altogether, so there is nothing to save.
         return False
-    return not _dsa_recomputes(config, "dsa_simple_routing")
+    return not config.recompute_selected("dsa_simple_routing")
 
 
 def _dsa_caches_indexer_k(config) -> bool:
@@ -175,7 +168,7 @@ def _dsa_caches_indexer_k(config) -> bool:
     if getattr(config, "dsa_fwd_use_dense_attn", False):
         # Dense indexer warmup reprojects a dense indexer K of its own.
         return False
-    return not _dsa_recomputes(config, "dsa_indexer_k")
+    return not config.recompute_selected("dsa_indexer_k")
 
 
 def _dsa_caches_selected_scores(config) -> bool:
@@ -192,7 +185,7 @@ def _dsa_caches_selected_scores(config) -> bool:
     if not getattr(config, "dsa_indexer_use_sparse_loss", False):
         # Sparse-forward dense-loss mode never materializes selected scores.
         return False
-    return not _dsa_recomputes(config, "dsa_selected_scores")
+    return not config.recompute_selected("dsa_selected_scores")
 
 
 def compute_gqa_dsa_indexer_loss(

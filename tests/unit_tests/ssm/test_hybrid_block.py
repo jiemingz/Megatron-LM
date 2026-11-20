@@ -8,6 +8,9 @@ import transformer_engine as te
 
 import megatron.core.models.hybrid.hybrid_block as hybrid_block_module
 import megatron.core.transformer.utils as transformer_utils
+from megatron.core.activation_policy.recompute.residual_recompute import (
+    build_recompute_block_end_plan,
+)
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
@@ -1035,21 +1038,13 @@ class TestHybridBlock:
         assert len(block.layers) == 4
         assert block._execution_layer_indices == [0, 1, 3, 4]
         assert block._residual_stream_atomic_layer_pairs == ((1, 2), (4, 5))
-        contexts = hybrid_block_module.build_residual_stream_recompute_plan(
+        # A replay block never ends inside a ShortcutMoE pair.
+        block_ends = build_recompute_block_end_plan(
             block.num_layers_per_pipeline_rank,
             2,
             atomic_layer_pairs=block._residual_stream_atomic_layer_pairs,
         )
-        assert contexts[1].manager is contexts[2].manager
-        assert contexts[4].manager is contexts[5].manager
-        assert [context.is_block_end for context in contexts] == [
-            True,
-            False,
-            True,
-            True,
-            False,
-            True,
-        ]
+        assert list(block_ends) == [True, False, True, True, False, True]
 
     def test_wide_residual_gpu_forward_and_backward(self):
         """Hybrid boundaries stay at D while every physical layer carries K * D."""
@@ -1112,10 +1107,13 @@ class TestHybridBlock:
             atomic_output = layer(hidden_states, attention_mask=attention_mask)
 
             model_parallel_cuda_manual_seed(123)
-            stage_one_state = layer.forward_pre_attn_and_core_attn(
-                hidden_states, attention_mask=attention_mask, packed_sequence_cp_metadata=None
-            )
-            two_stage_output = layer.forward_post_core_attn(*stage_one_state)
+            # A layer call enters the layer's quantization context; executors that run its
+            # stages enter it themselves.
+            with layer.get_inner_quantization_context():
+                stage_one_state = layer.forward_pre_attn_and_core_attn(
+                    hidden_states, attention_mask=attention_mask, packed_sequence_cp_metadata=None
+                )
+                two_stage_output = layer.forward_post_core_attn(*stage_one_state)
 
         def assert_bitwise_equal(actual, expected):
             assert type(actual) is type(expected)

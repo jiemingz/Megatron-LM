@@ -2,6 +2,12 @@
 
 """Megatron Module."""
 
+import copy
+import functools
+import inspect
+import weakref
+from abc import ABCMeta
+from contextlib import nullcontext
 from typing import Any, Optional, Tuple
 
 import torch
@@ -62,7 +68,48 @@ def is_first_microbatch_tracked(config) -> bool:
     )
 
 
-class MegatronModule(torch.nn.Module):
+# The classes whose own ``__init__`` completed for a module (see _MegatronModuleMeta).
+_COMPLETED_INITS_ATTR = "_megatron_completed_inits"
+
+
+class _MegatronModuleMeta(ABCMeta):
+    """Installs a module's activation strategies once it is fully constructed.
+
+    The install runs after the most-derived ``__init__`` returned (every subclass has built its
+    submodules), so a subclass only overrides :meth:`MegatronModule.activation_strategies`. It
+    only runs if the constructor that builds the strategies' points ran: the ``__init__`` of the
+    class that defines the ``activation_strategies`` in use. A subclass that bypasses that
+    constructor (a stand-in that builds only part of the module) gets no strategies.
+    Derives from ``ABCMeta`` so that Megatron modules can also be abstract base classes.
+    """
+
+    def __call__(cls, *args, **kwargs):
+        module = super().__call__(*args, **kwargs)
+        if _strategy_constructor(cls) in module.__dict__.get(_COMPLETED_INITS_ATTR, ()):
+            strategies = list(module.activation_strategies())
+            if strategies:
+                module.install_activation_strategies(strategies)
+        module.__dict__.pop(_COMPLETED_INITS_ATTR, None)
+        return module
+
+
+def _strategy_constructor(cls) -> type:
+    """The class whose ``__init__`` builds what ``cls.activation_strategies`` refers to: the first
+    class defining ``__init__`` in the MRO of the class that defines the method."""
+    owner = next(klass for klass in cls.__mro__ if "activation_strategies" in vars(klass))
+    return next(klass for klass in owner.__mro__ if "__init__" in vars(klass))
+
+
+def _record_completed_init(cls, init):
+    @functools.wraps(init)
+    def __init__(self, *args, **kwargs):
+        init(self, *args, **kwargs)
+        self.__dict__.setdefault(_COMPLETED_INITS_ATTR, set()).add(cls)
+
+    return __init__
+
+
+class MegatronModule(torch.nn.Module, metaclass=_MegatronModuleMeta):
     """Base Megatron module inhertied by all Models.
 
     Megatron specific extensions of torch Module with support
@@ -76,6 +123,13 @@ class MegatronModule(torch.nn.Module):
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.config = config
+        self.__dict__.setdefault(_COMPLETED_INITS_ATTR, set()).add(MegatronModule)
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        # Record when this class's own constructor completes (see _MegatronModuleMeta).
+        if "__init__" in vars(cls):
+            cls.__init__ = _record_completed_init(cls, vars(cls)["__init__"])
 
     @classmethod
     def estimate_flops(
@@ -97,6 +151,50 @@ class MegatronModule(torch.nn.Module):
         raise NotImplementedError(
             f"{cls.__name__} must implement estimate_flops for layer FLOP accounting."
         )
+
+    def activation_strategies(self) -> list:
+        """This module's activation strategies (``megatron.core.activation_policy.strategies``),
+        built from its config.
+
+        Called once, when the module is fully constructed (see :class:`_MegatronModuleMeta`); the
+        strategies are then installed. A strategy acts on a *point*: a child module
+        (``self.linear_fc1``) or a method (``self._mlp_bda``), hooked transparently (see
+        :class:`_ActivationPointHook`): callers keep calling the same module or method.
+        Subclasses override this, calling ``super().activation_strategies()`` to extend the base
+        class's list. None by default.
+        """
+        return []
+
+    def install_activation_strategies(self, strategies=()) -> None:
+        """Install ``strategies`` on this module, replacing any installed before.
+
+        Construction installs :meth:`activation_strategies`; call this only to replace them
+        afterwards (for example in tests).
+        """
+        from megatron.core.activation_policy.runtime import install_activation_strategies
+
+        install_activation_strategies(self, strategies)
+
+    def fire_activation_boundary(self, point, when: str, value, *, inputs: tuple = ()):
+        """Signal that ``point`` of this module was entered (``when="enter"``, ``value`` the
+        tensors to hook on) or returned (``when="exit"``, ``value`` its output, which is
+        returned, possibly replaced) without calling it.
+
+        For executors that run this module's stages through another schedule than its own
+        calls (for example a CUDA graph that ends where ``point`` would start).
+        """
+        from megatron.core.activation_policy.runtime import fire_boundary
+
+        return fire_boundary(self, point, when, value, inputs=inputs)
+
+    def get_residual_branches(self) -> list:
+        """This layer's residual branches (``activation_policy.ResidualBranch``): the residual
+        reads, writes and the ops between them that residual replay hooks. None by default."""
+        return []
+
+    def get_residual_branches_by_layer(self) -> list:
+        """:meth:`get_residual_branches` per physical layer this module runs (one by default)."""
+        return [self.get_residual_branches()]
 
     def refresh_cache(self) -> None:
         """Refresh state derived from parameters after an in-place weight refit.
@@ -243,10 +341,16 @@ class GraphableMegatronModule(MegatronModule):
         """
         return hasattr(self, 'cudagraph_manager')
 
+    def get_inner_quantization_context(self):
+        """This module's own FP8/FP4 context, entered around every call (layers with a
+        per-layer recipe override it; none by default)."""
+        return nullcontext()
+
     def __call__(self, *args, **kwargs):
-        if self._should_call_local_cudagraph(*args, **kwargs):
-            return self.cudagraph_manager(self, args, kwargs)
-        return super().__call__(*args, **kwargs)
+        with self.get_inner_quantization_context():
+            if self._should_call_local_cudagraph(*args, **kwargs):
+                return self.cudagraph_manager(self, args, kwargs)
+            return super().__call__(*args, **kwargs)
 
 
 def conversion_helper(val, conversion):
@@ -447,3 +551,171 @@ class Float16Module(MegatronModule):
         self, state_dict, strict=True
     ):  # pylint: disable=missing-function-docstring
         self.module.load_state_dict(state_dict, strict=strict)
+
+
+# ---------------------------------------------------------------------------------------------
+# Activation-policy hooks
+# ---------------------------------------------------------------------------------------------
+#
+# A strategy installed on an owner acts on a *point*: a child module or a method. The point is
+# hooked here, transparently: the module object, its class and how callers call it are
+# unchanged. A hooked call is handed to ``megatron.core.activation_policy.runtime``, which runs
+# the owner's strategies around it; strategies never see how they are attached.
+
+
+class _ActivationPointHook:
+    """Base of the per-point hooks: routes a call of the point to the owner's strategies.
+
+    The owner is held weakly: a recomputed call keeps itself alive from autograd hooks (which the
+    garbage collector cannot traverse) until backward. If that backward never happens, e.g. for
+    a tensor owned by a CUDA graph, a strong reference would pin the whole owner.
+    """
+
+    def _dispatch(self, point, forward, recompute, args, kwargs):
+        owner = self._owner()
+        if owner is None:
+            return forward(*args, **kwargs)
+        from megatron.core.activation_policy.runtime import run_point
+
+        return run_point(owner, point, forward, recompute, args, kwargs)
+
+    @property
+    def owner(self):
+        """The owner module (``None`` once it has been freed)."""
+        return self._owner()
+
+
+class _ModulePointHook(_ActivationPointHook):
+    """Instance-level ``forward`` of a child module hooked by its owner.
+
+    It runs inside ``nn.Module.__call__``, so the child's own hooks (parameter gathering, CUDA
+    graphs) wrap the hooked call as before. A recompute re-enters through ``__call__`` so those
+    hooks run again.
+    """
+
+    def __init__(self, owner, module: torch.nn.Module):
+        self._owner = weakref.ref(owner)
+        self.module, self.forward = module, module.forward
+        # An instance-level ``forward`` the module had before (restored on removal).
+        self.instance_forward = module.__dict__.get("forward")
+        self.bypass = False
+
+    def __deepcopy__(self, memo):
+        # When the owner is copied along with this child, route the copy through the owner's
+        # copy. A child copied on its own gets a plain forward: its copy has no owner.
+        owner = self.owner
+        owner_copy = memo.get(id(owner)) if owner is not None else None
+        if owner_copy is None:
+            return copy.deepcopy(self.forward, memo)
+        clone = _ModulePointHook.__new__(_ModulePointHook)
+        memo[id(self)] = clone
+        clone._owner = weakref.ref(owner_copy)
+        clone.module = copy.deepcopy(self.module, memo)
+        clone.forward = copy.deepcopy(self.forward, memo)
+        clone.instance_forward = copy.deepcopy(self.instance_forward, memo)
+        clone.bypass = False
+        return clone
+
+    def _recompute(self, *args, **kwargs):
+        self.bypass = True
+        try:
+            return self.module(*args, **kwargs)
+        finally:
+            self.bypass = False
+
+    def __call__(self, *args, **kwargs):
+        if self.bypass:
+            return self.forward(*args, **kwargs)
+        return self._dispatch(self.module, self.forward, self._recompute, args, kwargs)
+
+
+class _MethodPointHook(_ActivationPointHook):
+    """Instance attribute shadowing a hooked method of its owner (``self.m(...)`` still works).
+
+    It compares and hashes equal to the bound method it shadows, so a point named as ``self.m``
+    before or after the hook is attached is the same point.
+    """
+
+    def __init__(self, owner, method):
+        self._owner = weakref.ref(owner)
+        if isinstance(method, _MethodPointHook):  # named after its hook was attached
+            self.func, self.name = method.func, method.name
+        else:
+            self.func, self.name = method.__func__, method.__name__
+
+    def _bound(self):
+        return self.func.__get__(self._owner())
+
+    def __eq__(self, other):
+        if isinstance(other, _MethodPointHook):
+            return self.func is other.func and self._owner() is other._owner()
+        if inspect.ismethod(other):
+            return other.__func__ is self.func and other.__self__ is self._owner()
+        return NotImplemented
+
+    def __hash__(self):
+        return hash(self._bound())
+
+    def __deepcopy__(self, memo):
+        owner = self.owner
+        clone = _MethodPointHook.__new__(_MethodPointHook)
+        memo[id(self)] = clone
+        owner_copy = memo.get(id(owner)) if owner is not None else None
+        clone._owner = weakref.ref(owner_copy) if owner_copy is not None else lambda: None
+        clone.func, clone.name = self.func, self.name
+        return clone
+
+    def __call__(self, *args, **kwargs):
+        if self._owner() is None:
+            raise RuntimeError(f"The owner of hooked method {self.name!r} was freed.")
+        method = self._bound()
+        return self._dispatch(method, method, method, args, kwargs)
+
+
+def is_method_point(point) -> bool:
+    """Whether ``point`` is a method (bound, or already hooked) rather than a child module."""
+    return inspect.ismethod(point) or isinstance(point, _MethodPointHook)
+
+
+def attach_activation_point(owner: torch.nn.Module, point) -> None:
+    """Hook ``point`` (a child module, or a method of ``owner``) for ``owner``'s strategies."""
+    if is_method_point(point):
+        bound_owner = point.__self__ if inspect.ismethod(point) else point.owner
+        if bound_owner is not owner:
+            raise ValueError(
+                f"Method point {point.__name__ if inspect.ismethod(point) else point.name!r} "
+                f"must be a method of its owner {type(owner).__name__}."
+            )
+        name = point.__name__ if inspect.ismethod(point) else point.name
+        if not isinstance(owner.__dict__.get(name), _MethodPointHook):
+            owner.__dict__[name] = _MethodPointHook(owner, point)
+        return
+    if not isinstance(point, torch.nn.Module):
+        raise TypeError(
+            f"An activation point is a child module or a method, got {type(point).__name__}."
+        )
+    if point is owner:
+        raise ValueError("A module cannot be a point of itself.")
+    hook = point.__dict__.get("forward")
+    if isinstance(hook, _ModulePointHook):
+        if hook.owner is owner:
+            return
+        raise RuntimeError(f"Module {type(point).__name__} is already hooked by another owner.")
+    point.forward = _ModulePointHook(owner, point)
+
+
+def detach_activation_point(owner: torch.nn.Module, point) -> None:
+    """Remove the hook :func:`attach_activation_point` put on ``point`` for ``owner``."""
+    if is_method_point(point):
+        name = point.__name__ if inspect.ismethod(point) else point.name
+        if isinstance(owner.__dict__.get(name), _MethodPointHook):
+            del owner.__dict__[name]
+        return
+    if not isinstance(point, torch.nn.Module):
+        return
+    hook = point.__dict__.get("forward")
+    if isinstance(hook, _ModulePointHook) and hook.owner is owner:
+        if hook.instance_forward is None:
+            del point.__dict__["forward"]
+        else:
+            point.forward = hook.instance_forward

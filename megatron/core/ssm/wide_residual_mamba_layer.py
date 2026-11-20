@@ -1,19 +1,17 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Mamba layer specialization for streamwise wide-residual connections."""
 
-from contextlib import nullcontext
-
 from torch import Tensor
 
+from megatron.core.activation_policy import ReplayRegion, ResidualBranch
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
-from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.identity_op import is_identity
 from megatron.core.transformer.residual_connection import (
     ResidualBranchInput,
     ResidualConnectionState,
 )
-from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualConnection,
@@ -84,6 +82,17 @@ class WideResidualMambaLayer(MambaLayer):
                 f"{self.residual_read.branch_hidden_size}."
             )
 
+    def get_residual_branches(self) -> list[ResidualBranch]:
+        """The residual read, the connected input norm and the write around the mixer."""
+        ops = () if is_identity(self.norm) else (ReplayRegion(self, self.norm),)
+        return [
+            ResidualBranch(
+                read=ReplayRegion(self.residual_read, self.residual_read._compute_read),
+                ops=ops,
+                write=ReplayRegion(self.residual_write, self.residual_write._compute_write),
+            )
+        ]
+
     def sharded_state_dict(
         self, prefix: str = "", sharded_offsets: tuple = (), metadata: dict | None = None
     ) -> ShardedStateDict:
@@ -98,60 +107,39 @@ class WideResidualMambaLayer(MambaLayer):
         return self.residual_read, self.residual_write
 
     def _prepare_mixer_state(
-        self,
-        hidden_states: Tensor,
-        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
-    ) -> tuple[ResidualBranchInput[ResidualConnectionState], ResidualStreamRecomputeContext | None]:
-        """Read the wide stream and optionally replay its connected input normalization."""
+        self, hidden_states: Tensor
+    ) -> ResidualBranchInput[ResidualConnectionState]:
+        """Read the wide stream and normalize the branch input.
 
-        recompute_context = residual_stream_recompute_context
+        Under residual replay the read and the connected norm replay with their block (see
+        :meth:`get_residual_branches`).
+        """
+
         hidden_states, connection_state = apply_module(self.residual_read)(
             hidden_states,
             fp32_residual_connection=self.config.fp32_residual_connection,
             branch_input_dtype=self.config.params_dtype,
-            recompute_context=recompute_context,
         )
         # Validate the carried state before normalization can consume a hook-modified read.
         self.residual_read.residual_stream(connection_state)
 
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
-        if recompute_context is not None and not isinstance(self.norm, IdentityOp):
-            hidden_states = recompute_context.checkpoint(apply_module(self.norm), hidden_states)
-        else:
-            hidden_states = apply_module(self.norm)(hidden_states)
-        return ResidualBranchInput(hidden_states, connection_state), recompute_context
+        hidden_states = apply_module(self.norm)(hidden_states)
+        return ResidualBranchInput(hidden_states, connection_state)
 
-    def _apply_mixer_update(
-        self,
-        mixer_out_with_bias,
-        state: ResidualConnectionState,
-        recompute_context: ResidualStreamRecomputeContext | None = None,
-    ) -> Tensor:
-        """Write the mixer update, replaying only nonterminal residual writes."""
+    def _apply_mixer_update(self, mixer_out_with_bias, state: ResidualConnectionState) -> Tensor:
+        """Write the mixer update (replayed with its block unless it is the block's boundary)."""
 
         if state is None:
             raise RuntimeError("Missing state for the Mamba residual connection.")
-        # Block finalization discards checkpointed outputs. Keep the final write eager
-        # so its output stays live for the next forward operation and backward replay hook.
-        write_recompute_context = (
-            recompute_context
-            if recompute_context is not None and not recompute_context.is_block_end
-            else None
-        )
-        # Preserve the eager grad handler. Checkpointing must see the caller's grad mode
-        # so an outer no_grad() still disables replay registration.
-        grad_scope = (
-            self.bias_dropout_add_exec_handler()
-            if write_recompute_context is None
-            else nullcontext()
-        )
-        with grad_scope:
+        # The write replays with its block unless it is the block's live boundary (decided with
+        # the layer step's grad mode, so the grad handler below does not affect it).
+        with self.bias_dropout_add_exec_handler():
             return apply_module(self.residual_write)(
                 mixer_out_with_bias,
                 state=state,
                 dropout_probability=self.hidden_dropout,
                 training=self.training,
-                recompute_context=write_recompute_context,
             )
 
     def _pack_two_stage_output(
@@ -162,18 +150,9 @@ class WideResidualMambaLayer(MambaLayer):
         return ssm_output, state[0], state
 
     def forward_post_core_attn(
-        self,
-        ssm_output: Tensor,
-        residual: Tensor,
-        connection_state: ResidualConnectionState,
-        *,
-        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+        self, ssm_output: Tensor, residual: Tensor, connection_state: ResidualConnectionState
     ) -> Tensor:
         """Project the mixer output and write it to the saved wide-residual stream."""
 
         mixer_out_with_bias = self.mixer.forward_post_core_attn(ssm_output)
-        return self._apply_mixer_update(
-            mixer_out_with_bias,
-            connection_state,
-            recompute_context=residual_stream_recompute_context,
-        )
+        return self._apply_mixer_update(mixer_out_with_bias, connection_state)

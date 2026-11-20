@@ -5,13 +5,11 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
-from functools import partial
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
 
-from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import HAVE_TE_GDN, TEGatedDeltaNetAttention
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
@@ -330,29 +328,16 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         )
         nvtx_range_pop(suffix="gated_delta_rule")
 
-        if self.recompute_norm_out:
-            self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            norm_func = partial(
-                self._gated_norm_and_a2a,
-                thd_cp_a2a_inv=thd_cp_a2a_inv,
-                batch=batch,
-                seq_len=seq_len,
-                cp_size=cp_size,
-                cp_group=cp_group,
-                packed_seq_params=packed_seq_params,
-            )
-            norm_out = self.norm_out_checkpoint.checkpoint(norm_func, core_attn_out, gate)
-        else:
-            norm_out = self._gated_norm_and_a2a(
-                core_attn_out,
-                gate,
-                thd_cp_a2a_inv,
-                batch,
-                seq_len,
-                cp_size,
-                cp_group,
-                packed_seq_params,
-            )
+        norm_out = self._gated_norm_and_a2a(
+            core_attn_out,
+            gate,
+            thd_cp_a2a_inv=thd_cp_a2a_inv,
+            batch=batch,
+            seq_len=seq_len,
+            cp_size=cp_size,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+        )
 
         return norm_out
 

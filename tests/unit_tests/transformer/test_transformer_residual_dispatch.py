@@ -5,25 +5,20 @@ Scheduling uses real Transformer methods; ordinary tuple-norm tests also replay
 real checkpoints. Attention, MLP, residual arithmetic, and offload are excluded.
 """
 
-from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
 
-from megatron.core.tensor_parallel.random import (
-    CheckpointWithoutOutputManager,
-    model_parallel_cuda_manual_seed,
+from megatron.core.activation_policy import (
+    CheckpointWithoutOutputStrategy,
+    Event,
+    install_activation_strategies,
 )
-from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
-
-
-class _OffloadContext(nullcontext):
-    def group_offload(self, value, **kwargs):
-        return value
 
 
 class _Connection(nn.Module):
@@ -73,10 +68,6 @@ class _DispatchLayer(TransformerLayer):
         self.pre_mlp_layernorm = nn.LayerNorm(4)
         self._input_layernorm_returns_residual = False
         self._pre_mlp_layernorm_returns_residual = False
-        self.recompute_input_layernorm = self.recompute_pre_mlp_layernorm = False
-        self.mhc_checkpoint_input_layernorm = self.mhc_checkpoint_pre_mlp_layernorm = False
-        self.offload_attn_norm = self.offload_mlp_norm = False
-        self.off_interface = lambda enabled, value, name: _OffloadContext(value)
         self.bias_dropout_add_exec_handler = torch.enable_grad
         self._legacy_forward_post_mlp = None
         self.events = []
@@ -88,35 +79,31 @@ class _DispatchLayer(TransformerLayer):
                     _Connection(operation) if connections else None,
                 )
 
-    def _read_residual_connection(self, connection, value, *, is_mlp, recompute_context):
-        self.events.append(("read", connection, is_mlp, recompute_context))
-        return super()._read_residual_connection(
-            connection, value, is_mlp=is_mlp, recompute_context=recompute_context
-        )
+    def _read_residual_connection(self, connection, value, *, is_mlp):
+        self.events.append(("read", connection, is_mlp))
+        return super()._read_residual_connection(connection, value, is_mlp=is_mlp)
 
-    def _write_residual_connection(self, connection, value, state, *, is_mlp, recompute_context):
-        self.events.append(("write", connection, is_mlp, recompute_context))
-        return super()._write_residual_connection(
-            connection, value, state, is_mlp=is_mlp, recompute_context=recompute_context
-        )
+    def _write_residual_connection(self, connection, value, state, *, is_mlp):
+        self.events.append(("write", connection, is_mlp))
+        return super()._write_residual_connection(connection, value, state, is_mlp=is_mlp)
 
 
 def _layer(connections=True):
     return _DispatchLayer(connections).to("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def _read(layer, value, is_mlp, context=None):
+def _read(layer, value, is_mlp):
     method = layer._pre_mlp_layernorm_and_residual if is_mlp else layer._run_input_layernorm
-    return method(value, residual_stream_recompute_context=context)
+    return method(value)
 
 
-def _write(layer, value, residual, state, is_mlp, context=None):
+def _write(layer, value, residual, state, is_mlp):
     method = layer._apply_mlp_bda_step if is_mlp else layer._apply_self_attn_bda_step
-    return method(value, residual, state, residual_stream_recompute_context=context)
+    return method(value, residual, state)
 
 
-def _checkpoint(layer, is_mlp):
-    return layer.pre_mlp_norm_checkpoint if is_mlp else layer.input_layernorm_checkpoint
+def _bda_point(layer, is_mlp):
+    return layer._mlp_bda if is_mlp else layer._self_attn_bda
 
 
 @pytest.fixture
@@ -144,19 +131,17 @@ def test_getters_handle_optional_connections_and_invalid_operations(is_mlp):
         getter("invalid")
 
 
-@pytest.mark.parametrize(
-    ("is_mlp", "mode"),
-    [
-        (False, "eager"),
-        (True, "eager"),
-        (False, "nonterminal"),
-        (True, "nonterminal"),
-        (False, "terminal"),
-        (True, "terminal"),
-        (False, "terminal_attention_only"),
-    ],
-)
-def test_stage_dispatch_preserves_call_settings_and_reader_state(is_mlp, mode):
+@pytest.mark.parametrize("has_mlp_writer", [False, True])
+def test_last_residual_write_is_the_mlp_write_when_configured(has_mlp_writer):
+    layer = _layer()
+    if not has_mlp_writer:
+        layer.residual_write_mlp = None
+    assert layer._is_last_residual_write(is_mlp=True)
+    assert layer._is_last_residual_write(is_mlp=False) is not has_mlp_writer
+
+
+@pytest.mark.parametrize("is_mlp", [False, True], ids=["attention", "mlp"])
+def test_stage_dispatch_preserves_call_settings_and_reader_state(is_mlp):
     layer = _layer().eval()
     layer.config.fp32_residual_connection = True
     layer.config.params_dtype = torch.bfloat16
@@ -164,15 +149,6 @@ def test_stage_dispatch_preserves_call_settings_and_reader_state(is_mlp, mode):
     layer.hidden_dropout = 0.25
     # A replaced norm can leave stale metadata; the reader still owns the residual.
     layer._input_layernorm_returns_residual = layer._pre_mlp_layernorm_returns_residual = True
-    if mode == "terminal_attention_only":
-        layer.residual_write_mlp = None
-    context = (
-        None
-        if mode == "eager"
-        else ResidualStreamRecomputeContext(
-            CheckpointWithoutOutputManager(), is_block_end=mode.startswith("terminal")
-        )
-    )
     stage = "mlp" if is_mlp else "self_attn"
     reader, writer = getattr(layer, f"residual_read_{stage}"), getattr(
         layer, f"residual_write_{stage}"
@@ -186,34 +162,20 @@ def test_stage_dispatch_preserves_call_settings_and_reader_state(is_mlp, mode):
             with_kwargs=True,
         )
     value = torch.randn(2, 1, 8, device=next(layer.parameters()).device)
-    branch, residual, state = _read(layer, value, is_mlp, context)
+    branch, residual, state = _read(layer, value, is_mlp)
     assert state is reader.selected_state and residual is state[0]
     torch.testing.assert_close(residual, value * 2)
     branch_output = (branch, None)
     with torch.no_grad():
-        _write(layer, branch_output, residual, state, is_mlp, context)
-    write_context = (
-        None if mode == "terminal_attention_only" or (is_mlp and mode == "terminal") else context
-    )
+        _write(layer, branch_output, residual, state, is_mlp)
     assert branch.dtype == torch.bfloat16 and len(calls) == 2
     assert calls[0][0] is reader and calls[0][1][0] is value
-    assert calls[0][2] == {
-        "fp32_residual_connection": True,
-        "branch_input_dtype": torch.bfloat16,
-        "recompute_context": context,
-    }
+    assert calls[0][2] == {"fp32_residual_connection": True, "branch_input_dtype": torch.bfloat16}
     assert calls[1][0] is writer and calls[1][1][0] is branch_output
-    assert calls[1][2]["state"] is state
-    assert calls[1][2]["dropout_probability"] == 0.25
-    assert calls[1][2]["training"] is False
-    assert calls[1][2]["recompute_context"] is write_context
-    assert calls[1][3] is (write_context is None)
-    assert layer.events == [
-        ("read", reader, is_mlp, context),
-        ("write", writer, is_mlp, write_context),
-    ]
-    if context is not None:
-        assert not _checkpoint(layer, is_mlp).retain_input_tensors
+    assert calls[1][2] == {"state": state, "dropout_probability": 0.25, "training": False}
+    # The write runs inside the layer's bias-dropout-add grad handler.
+    assert calls[1][3] is True
+    assert layer.events == [("read", reader, is_mlp), ("write", writer, is_mlp)]
 
 
 @pytest.mark.parametrize("is_mlp", [False, True], ids=["attention", "mlp"])
@@ -243,7 +205,18 @@ def test_ordinary_tuple_norm_preserves_selected_residual_and_gradients(
     norm = _TupleNorm().to(next(actual.parameters()).device)
     setattr(actual, name, norm)
     setattr(actual, f"_{name}_returns_residual", True)
-    setattr(actual, f"recompute_{name}", recompute)
+    if recompute:
+        # As TransformerLayer installs it for "layernorm" recompute.
+        install_activation_strategies(
+            actual,
+            [
+                CheckpointWithoutOutputStrategy(
+                    norm,
+                    release_on=Event(_bda_point(actual, is_mlp), "enter"),
+                    retain_input_tensors=True,
+                )
+            ],
+        )
     value = torch.randn(2, 1, 4, device=norm.weight.device, requires_grad=True)
     saved_value = value.detach().clone()
     expected_branch = saved_value.square()
@@ -255,10 +228,9 @@ def test_ordinary_tuple_norm_preserves_selected_residual_and_gradients(
     boundary = (branch + residual).square().sum()
     torch.testing.assert_close(boundary, expected_sum.square().sum())
     if recompute:
-        checkpoint = _checkpoint(actual, is_mlp)
-        assert checkpoint.retain_input_tensors
         input_bytes = value.untyped_storage().nbytes()
-        checkpoint.discard_output_and_register_recompute(boundary)
+        # Entering the residual add releases the norm output and hooks its rebuild on boundary.
+        actual.fire_activation_boundary(_bda_point(actual, is_mlp), "enter", (boundary,))
         assert branch.untyped_storage().nbytes() == 0
         assert (
             value.untyped_storage().nbytes() == residual.untyped_storage().nbytes() == input_bytes

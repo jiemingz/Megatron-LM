@@ -1,7 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import dataclasses
-from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import Mock
@@ -285,8 +284,6 @@ def test_fine_grained_router_receives_runtime_cp(monkeypatch):
         config=SimpleNamespace(moe_token_dispatcher_type="alltoall"),
         _forward_attention=Mock(return_value=(hidden, None)),
         _forward_mlp=lambda hidden_states: hidden_states,
-        offload_mlp_norm=False,
-        recompute_pre_mlp_layernorm=False,
         _pre_mlp_layernorm_returns_residual=False,
         pre_mlp_layernorm=torch.nn.Identity(),
         init_backward_dw_wrapper=Mock(),
@@ -305,9 +302,6 @@ def test_fine_grained_router_receives_runtime_cp(monkeypatch):
         layer_state=SimpleNamespace(),
         detach=lambda tensor: tensor.detach(),
     )
-    monkeypatch.setattr(
-        fine_grained_callables, "off_interface", lambda _enabled, tensor, _name: nullcontext(tensor)
-    )
     forward_funcs, _ = fine_grained_callables.build_transformer_layer_callables(layer)
     forward_funcs[0](node, hidden)
     mlp.route.assert_called_once_with(hidden, padding_mask, packed_seq_params=packed)
@@ -321,7 +315,6 @@ def test_shortcut_router_receives_runtime_cp():
     mlp = Mock(spec=MoELayer)
     mlp.route.return_value = (probs, probs.bool())
     block = SimpleNamespace(
-        recompute_shortcut_pre_mlp_layernorm=False,
         shortcut_pre_mlp_layernorm=torch.nn.Identity(),
         moe_layer=SimpleNamespace(
             mlp=mlp, _maybe_unflatten_for_moe=Mock(return_value=(hidden, padding_mask, None, None))

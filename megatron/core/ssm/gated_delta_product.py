@@ -8,14 +8,13 @@ import inspect
 import logging
 import math
 from dataclasses import dataclass, replace
-from functools import partial
 from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from megatron.core import tensor_parallel
+from megatron.core.activation_policy import CheckpointWithoutOutputStrategy, Event, OffloadStrategy
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
     LocalNonpersistentObject,
@@ -27,9 +26,6 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_masked_update,
 )
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    FineGrainedActivationOffloadingInterface as off_interface,
-)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic, causal_conv1d_cp
 from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
@@ -368,21 +364,6 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         self.pp_layer_offset = pp_layer_offset
         self.cached_batch_size = None
 
-        self.recompute_in_proj = (
-            self.config.recompute_granularity == "selective"
-            and "gdp_in_proj" in self.config.recompute_modules
-        )
-
-        self.recompute_qkv = (
-            self.config.recompute_granularity == "selective"
-            and "gdp_qkv" in self.config.recompute_modules
-        )
-
-        self.offload_gdp_qkv = (
-            self.config.fine_grained_activation_offloading
-            and "gdp_qkv" in self.config.offload_modules
-        )
-
         tp_size = self.pg_collection.tp.size()
 
         self.nheads_local_tp = self.nheads // tp_size
@@ -557,6 +538,41 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             self.d_inner_local_cp = self.d_inner_local_tp
             self.nheads_local_cp = self.nheads_local_tp
             self.ngroups_local_cp = self.ngroups_local_tp
+        if self.config.recompute_selected("gdp_in_proj") and self.config.offload_selected(
+            "gdp_qkv"
+        ):
+            raise ValueError(
+                "gdp_qkv cannot be set in offload_modules together with gdp_in_proj in "
+                "recompute_modules."
+            )
+
+    def activation_strategies(self) -> list:
+        """Points, in forward order: _in_proj_preprocess, _prepare_qkv, _postprocess. qkv recompute
+        releases on postprocess entry, so its rebuild hooks on core_attn_out. The gdp_qkv offload
+        group commits on the mixer output; its backward waits for the reload before the qkv
+        rebuild unpacks the saved conv input. in_proj recompute releases on the mixer output, so
+        it rebuilds first in the mixer's backward."""
+        config = self.config
+        recompute_in_proj = config.recompute_selected("gdp_in_proj")
+        offload_qkv = config.offload_selected("gdp_qkv")
+        activation_strategies = []
+        if recompute_in_proj:
+            activation_strategies.append(
+                CheckpointWithoutOutputStrategy(
+                    self._in_proj_preprocess, release_on=Event(self._postprocess, "exit")
+                )
+            )
+        if offload_qkv:
+            activation_strategies.append(
+                OffloadStrategy(self._prepare_qkv, "gdp_qkv", commit_on=self._postprocess)
+            )
+        if config.recompute_selected("gdp_qkv"):
+            activation_strategies.append(
+                CheckpointWithoutOutputStrategy(
+                    self._prepare_qkv, release_on=Event(self._postprocess, "enter")
+                )
+            )
+        return activation_strategies
 
     def forward_pre_attn_and_core_attn(
         self,
@@ -749,32 +765,12 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         if runtime_cp is None:
             runtime_cp = self._resolve_runtime_cp(packed_seq_params)
 
-        if self.recompute_in_proj:
-            # Checkpoint the input projection and its preprocessing, discard the z, VKQ,
-            # and ba outputs after the forward pass, and recompute them in the backward
-            # pass to save memory. Only the (much smaller) hidden_states input is kept.
-            #
-            # Quantized replay is safe for the same reason as in MLASelfAttention:
-            # CheckpointWithoutOutput records the forward recipe and amax state and
-            # replays under the recorded fp8_autocast, and the only quantized op inside
-            # _in_proj_preprocess is in_proj itself. Everything downstream of it (causal
-            # conv, gated delta product kernel) runs unquantized.
-            quantization = self.config.fp8 or self.config.fp4
-            in_proj_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=quantization)
-            # ``packed_seq_params`` is bound rather than passed through ``checkpoint`` so
-            # that only tensors reach ``ctx.save_for_backward``.
-            z, VKQ, ba = in_proj_checkpoint.checkpoint(
-                partial(
-                    self._in_proj_preprocess,
-                    packed_seq_params=packed_seq_params,
-                    runtime_cp=runtime_cp,
-                ),
-                hidden_states,
-            )
-        else:
-            z, VKQ, ba = self._in_proj_preprocess(
-                hidden_states, packed_seq_params=packed_seq_params, runtime_cp=runtime_cp
-            )
+        # Point ``_in_proj_preprocess``: the input projection and its CP gather/split, kept as
+        # one unit so that a recompute of it saves only ``hidden_states``. ``packed_seq_params`` and
+        # ``runtime_cp`` are keywords so that only tensors become checkpoint inputs.
+        z, VKQ, ba = self._in_proj_preprocess(
+            hidden_states, packed_seq_params=packed_seq_params, runtime_cp=runtime_cp
+        )
 
         conv_seq_idx, kernel_cu_seqlens = self._packed_metadata(packed_seq_params)
         preceding_rank_start = 0
@@ -790,35 +786,15 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         if self.config.gdp_cutedsl_kernel and kernel_cu_seqlens is None:
             kernel_cu_seqlens = self._make_uniform_cutedsl_cu_seqlens(VKQ, runtime_cp)
 
-        # The offload group captures the tensors saved for backward inside the causal
-        # conv and QKV preparation: the checkpoint's saved input VKQ when QKV recompute
-        # is enabled, or the conv/QKV-prep internal saves otherwise.
-        qkv_manager = off_interface(self.offload_gdp_qkv, VKQ, "gdp_qkv")
-        with qkv_manager as VKQ:
-            if self.recompute_qkv:
-                # Checkpoint the causal conv and QKV preparation, discard the
-                # query/key/value outputs after the forward pass, and recompute them
-                # in the backward pass to save memory.
-                qkv_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-                query, key, value = qkv_checkpoint.checkpoint(
-                    partial(
-                        self._prepare_qkv,
-                        conv_state=conv_state,
-                        seq_idx=conv_seq_idx,
-                        l2_norm_in_kernel=self.config.gdp_cutedsl_kernel,
-                        runtime_cp=runtime_cp,
-                    ),
-                    VKQ,
-                )
-            else:
-                # _prepare_qkv also seeds conv_state during prefill
-                query, key, value = self._prepare_qkv(
-                    VKQ,
-                    conv_state=conv_state,
-                    seq_idx=conv_seq_idx,
-                    l2_norm_in_kernel=self.config.gdp_cutedsl_kernel,
-                    runtime_cp=runtime_cp,
-                )
+        # Point ``_prepare_qkv``: the causal conv and QKV preparation (it also seeds conv_state
+        # during prefill). Its first argument VKQ is where a ``gdp_qkv`` offload group starts.
+        query, key, value = self._prepare_qkv(
+            VKQ,
+            conv_state=conv_state,
+            seq_idx=conv_seq_idx,
+            l2_norm_in_kernel=self.config.gdp_cutedsl_kernel,
+            runtime_cp=runtime_cp,
+        )
 
         beta, g = self._compute_gating(ba, runtime_cp=runtime_cp)
 
@@ -839,26 +815,11 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         if ssm_state is not None:
             ssm_state.copy_(last_recurrent_state)
 
-        if self.recompute_qkv:
-            qkv_checkpoint.discard_output_and_register_recompute(core_attn_out)
-
-        y = self._postprocess(
+        # Point ``_postprocess``: its entry (on core_attn_out) and exit (on the mixer output y)
+        # are where the qkv/in_proj recomputes release and the ``gdp_qkv`` group commits.
+        return self._postprocess(
             core_attn_out, z, packed_seq_params=packed_seq_params, runtime_cp=runtime_cp
         )
-
-        # Commit the offload group downstream of core_attn_out: the commit node's
-        # backward, which waits on the reload event, then runs before the recompute
-        # hook on core_attn_out unpacks the saved conv input.
-        y = qkv_manager.group_offload(y, forced_released_tensors=[])
-
-        if self.recompute_in_proj:
-            # Hook on the mixer output so the recompute runs at the very start of this
-            # mixer's backward: z is needed by the output norm, and VKQ is needed by the
-            # causal conv backward or by the QKV recompute hook on core_attn_out, all of
-            # which come later in the backward pass.
-            in_proj_checkpoint.discard_output_and_register_recompute(y)
-
-        return y
 
     def _run_gdp_kernel(
         self,
@@ -1195,11 +1156,9 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             # the gated norm's flattening preserves this unit-column-stride view,
             # so in_proj recompute can discard and restore the norm's saved gate.
             # Headwise CP and larger batches keep their existing materialization.
-            keep_gate_view = (
-                self.recompute_in_proj
-                and (runtime_cp.group.size() == 1 or runtime_cp.chunkwise)
-                and z.shape[1] == 1
-            )
+            keep_gate_view = (runtime_cp.group.size() == 1 or runtime_cp.chunkwise) and z.shape[
+                1
+            ] == 1
             if not keep_gate_view:
                 z = z.contiguous()
             if not runtime_cp.chunkwise:

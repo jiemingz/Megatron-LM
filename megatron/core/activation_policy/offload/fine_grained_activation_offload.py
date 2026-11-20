@@ -9,7 +9,9 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 from torch.autograd.graph import saved_tensors_hooks
 
-from megatron.core.tensor_parallel.random import is_checkpoint_without_output_tensor
+from megatron.core.activation_policy.recompute.checkpointing import (
+    is_checkpoint_without_output_tensor,
+)
 
 # CPU offload implementation for pipeline parallelism
 DEBUG = False
@@ -20,7 +22,7 @@ try:
 except ImportError:
     from megatron.core.telemetry.fallbacks import trace_fn as _otel_trace_fn
 
-from megatron.core.pipeline_parallel.pinned_activation_buffer import PinnedActivationBuffer
+from megatron.core.activation_policy.offload.pinned_activation_buffer import PinnedActivationBuffer
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 

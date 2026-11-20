@@ -7,6 +7,10 @@ import torch
 
 import megatron.core.transformer.moe.router as router_mod
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.activation_policy.recompute.checkpointing import (
+    CheckpointWithoutOutput,
+    checkpoint,
+)
 from megatron.core.extensions.transformer_engine import HAVE_TE, te_checkpoint
 from megatron.core.tensor_observation import (
     capture_tensor_observations,
@@ -89,7 +93,7 @@ def test_tensor_observation_observes_checkpoint_forward_not_recomputation():
     with capture_tensor_observations(
         lambda *args: observed.append((torch.is_grad_enabled(), args)), frozenset({"activation"})
     ):
-        output = tensor_parallel.checkpoint(checkpointed, False, value)
+        output = checkpoint(checkpointed, False, value)
         output.sum().backward()
 
     assert executions == [False, True]
@@ -144,7 +148,7 @@ def test_tensor_observation_observes_checkpoint_without_output_forward_not_recom
     owner = object()
     executions = []
     observed = []
-    checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=None)
+    checkpoint = CheckpointWithoutOutput(fp8=None)
 
     def checkpointed(value):
         executions.append(torch.is_grad_enabled())

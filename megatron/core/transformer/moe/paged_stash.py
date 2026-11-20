@@ -7,10 +7,12 @@ from typing import Any
 import torch
 
 from megatron.core._rank_utils import log_single_rank
+from megatron.core.activation_policy.recompute.checkpointing import (
+    is_checkpoint_without_output_tensor,
+)
 from megatron.core.extensions.transformer_engine import is_grouped_tensor_marked
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
-from megatron.core.tensor_parallel.random import is_checkpoint_without_output_tensor
 from megatron.core.transformer.moe.ops.paged_stash import (
     GLOBAL_BLOCK_SIZE,
     GLOBAL_MAX_BLOCKS,

@@ -56,40 +56,44 @@ def test_shortcut_uses_moe_layout_mask_for_routed_and_shared_paths(with_layout):
     input_mask = torch.tensor([[False, True]])
     moe_mask = torch.tensor([[True, False]])
     masks_by_layout = {"zigzag": moe_mask}
-    input_packed, attn_packed, moe_packed = object(), object(), object()
+    input_packed, moe_packed = object(), object()
     calls = []
 
     def prepare(layer_idx, hidden):
+        # The layer stack prepared the pair's input in the attention layer's layout; the pair
+        # converts to the MoE layer's layout itself.
+        assert layer_idx == 5
         calls.append(("prepare", layer_idx))
-        return hidden, attn_packed if layer_idx == 4 else moe_packed
+        return hidden, moe_packed
 
     def mask_for_layer(layer_idx, padding_mask, padding_mask_by_layout):
         assert layer_idx == 5
         assert padding_mask is input_mask and padding_mask_by_layout is masks_by_layout
         return moe_mask
 
-    def route(shortcut_hidden, padding_mask, packed_seq_params, recompute_context=None):
-        assert recompute_context is None
+    def route(shortcut_hidden, padding_mask, packed_seq_params):
         assert padding_mask is (moe_mask if with_layout else input_mask)
         assert packed_seq_params is (moe_packed if with_layout else input_packed)
         return shortcut_hidden, shortcut_hidden
 
-    def shared(hidden_states, padding_mask, packed_seq_params, recompute_context=None):
-        route(hidden_states, padding_mask, packed_seq_params, recompute_context)
+    def shared(hidden_states, padding_mask, packed_seq_params):
+        route(hidden_states, padding_mask, packed_seq_params)
         return torch.zeros_like(hidden_states), None, hidden_states, ()
 
     def attention(hidden_states, packed_seq_params, **kwargs):
-        assert packed_seq_params is (attn_packed if with_layout else input_packed)
+        assert packed_seq_params is input_packed
         return (hidden_states,)
 
     block = SimpleNamespace(
         compute_layer=SimpleNamespace(
             config=object(),
+            get_inner_quantization_context=nullcontext,
             forward_pre_attn_and_core_attn=attention,
             forward_post_core_attn=lambda value: value,
         ),
         moe_layer=SimpleNamespace(
             config=object(),
+            get_inner_quantization_context=nullcontext,
             mlp=SimpleNamespace(routed_experts_compute=lambda value, probs: (value, None)),
         ),
         attn_local_idx=4,
@@ -97,8 +101,7 @@ def test_shortcut_uses_moe_layout_mask_for_routed_and_shared_paths(with_layout):
         attn_layer_idx=8,
         moe_layer_idx=9,
         overlap_mode=False,
-        shortcut_pre_mlp_layernorm_checkpoint=None,
-        _read_shortcut_hidden=lambda value, recompute_context: value,
+        _read_shortcut_hidden=lambda value: value,
         _moe_router_preprocess=route,
         _moe_shared_experts=shared,
         _launch_dispatch=lambda value, probs, **kwargs: (value, probs),
@@ -123,9 +126,8 @@ def test_shortcut_uses_moe_layout_mask_for_routed_and_shared_paths(with_layout):
         sequence_len_offset=None,
         packed_seq_params=input_packed,
         padding_mask=input_mask,
-        quant_context_factory=lambda *args: nullcontext(),
         cp_layout_state=layout if with_layout else None,
         padding_mask_by_layout=masks_by_layout,
     )
     torch.testing.assert_close(output, hidden)
-    assert calls == ([("prepare", 4), ("prepare", 5), ("prepare", 5)] if with_layout else [])
+    assert calls == ([("prepare", 5), ("prepare", 5)] if with_layout else [])

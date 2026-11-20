@@ -10,6 +10,7 @@ import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 import megatron.core.transformer.cuda_graphs as cuda_graphs_module
+from megatron.core.activation_policy.recompute.checkpointing import CheckpointWithoutOutput
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.extensions.te_cuda_graphs import set_te_cuda_graph_current_microbatch
@@ -32,7 +33,6 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
-    CheckpointWithoutOutput,
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
 )

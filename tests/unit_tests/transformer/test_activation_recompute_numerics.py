@@ -15,7 +15,8 @@ import traceback
 import pytest
 import torch
 
-from megatron.core import recompute as recompute_module
+from megatron.core.activation_policy import strategies as activation_policy_strategies
+from megatron.core.activation_policy.recompute import checkpointing as checkpointing_module
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_mtp_block_spec,
@@ -23,10 +24,6 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer import multi_token_prediction as mtp_module
-from megatron.core.transformer import transformer_layer as transformer_layer_module
-from megatron.core.transformer import utils as transformer_utils
-from megatron.core.transformer.moe import moe_layer as moe_layer_module
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
@@ -57,38 +54,33 @@ _FULL = {"recompute_granularity": "full", "recompute_method": "uniform", "recomp
 
 # case id -> (model kind, recompute args, modules whose precision_aware_checkpoint must fire)
 _RECOMPUTE_CASES = {
-    "full": ("dense", _FULL, {"recompute"}),
+    "full": ("dense", _FULL, {"activation_policy"}),
     "full_distribute_saved_activations": (
         # distribute_saved_activations shards the saved input across TP, which requires the
         # input to be replicated across TP ranks, i.e. no sequence parallelism.
         "dense_no_sp",
         {**_FULL, "distribute_saved_activations": True},
-        {"recompute"},
+        {"activation_policy"},
     ),
-    "full_with_mtp": ("dense_mtp", _FULL, {"recompute", "multi_token_prediction"}),
+    "full_with_mtp": ("dense_mtp", _FULL, {"activation_policy"}),
     "selective_mlp": (
         "dense",
         {"recompute_granularity": "selective", "recompute_modules": ["mlp"]},
-        {"transformer_layer"},
+        {"activation_policy"},
     ),
     "selective_moe": (
         "moe",
         {"recompute_granularity": "selective", "recompute_modules": ["moe"]},
-        {"moe_layer"},
+        {"activation_policy"},
     ),
     "selective_shared_experts": (
         "moe_shared_experts",
         {"recompute_granularity": "selective", "recompute_modules": ["shared_experts"]},
-        {"moe_layer"},
+        {"activation_policy"},
     ),
 }
 
-_CALL_SITE_MODULES = {
-    "recompute": recompute_module,
-    "transformer_layer": transformer_layer_module,
-    "moe_layer": moe_layer_module,
-    "multi_token_prediction": mtp_module,
-}
+_CALL_SITE_MODULES = {"activation_policy": activation_policy_strategies}
 
 
 def _skip_if_unsupported(precision: str) -> None:
@@ -283,7 +275,7 @@ class TestActivationRecomputeNumerics:
         """
         calls = []
         primitives = []
-        real_checkpoint = transformer_utils.precision_aware_checkpoint
+        real_checkpoint = checkpointing_module.precision_aware_checkpoint
 
         for site, module in _CALL_SITE_MODULES.items():
 
@@ -301,14 +293,16 @@ class TestActivationRecomputeNumerics:
 
             monkeypatch.setattr(module, "precision_aware_checkpoint", spy)
 
-        real_tp_checkpoint = transformer_utils.tensor_parallel.checkpoint
+        from megatron.core.activation_policy.recompute import checkpointing as recompute_module
+
+        real_tp_checkpoint = recompute_module.checkpoint
 
         def tp_checkpoint_spy(*args, **kwargs):
             # args: (function, distribute_saved_activations, *function_args)
             primitives.append(("tensor_parallel.checkpoint", args[1]))
             return real_tp_checkpoint(*args, **kwargs)
 
-        monkeypatch.setattr(transformer_utils.tensor_parallel, "checkpoint", tp_checkpoint_spy)
+        monkeypatch.setattr(recompute_module, "checkpoint", tp_checkpoint_spy)
 
         from megatron.core.extensions import transformer_engine as te_extensions
 

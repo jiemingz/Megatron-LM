@@ -6,7 +6,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from megatron.core.models.hybrid import hybrid_block as hybrid_block_module
+import megatron.core.activation_policy.recompute.residual_recompute as residual_recompute_module
 from megatron.core.models.hybrid.hybrid_layer_specs import wide_residual_hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
@@ -107,15 +107,16 @@ class TestWideResidualMTPAndMIMO:
         self, monkeypatch, fp32_residual_connection
     ):
         replay_plan_calls = []
-        build_replay_plan = hybrid_block_module.build_residual_stream_recompute_plan
+        build_replay_plan = residual_recompute_module.build_recompute_block_end_plan
 
         def track_replay_plan(num_layers, block_size, *, atomic_layer_pairs=()):
             atomic_layer_pairs = tuple(atomic_layer_pairs)
             replay_plan_calls.append((num_layers, block_size, atomic_layer_pairs))
             return build_replay_plan(num_layers, block_size, atomic_layer_pairs=atomic_layer_pairs)
 
+        # The replay plan is built when the layer stack installs its residual replay.
         monkeypatch.setattr(
-            hybrid_block_module, "build_residual_stream_recompute_plan", track_replay_plan
+            residual_recompute_module, "build_recompute_block_end_plan", track_replay_plan
         )
         config = _wide_config(
             num_layers=2,

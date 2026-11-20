@@ -14,6 +14,9 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 from typing_extensions import override
 
+from megatron.core.activation_policy.offload.te_cpu import (
+    mark_activation as mark_te_cpu_offload_activation,
+)
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import (
@@ -1423,14 +1426,7 @@ class ColumnParallelLinear(torch.nn.Module):
         # Matrix multiply.
         allreduce_dgrad = False if self.explicit_expert_comm else self.allreduce_dgrad
 
-        if self.config._cpu_offloading_context is not None:
-            if self.config._cpu_offloading_context.inside_context is True:
-                if not HAVE_TE:
-                    assert (
-                        self.config.cpu_offloading is False
-                    ), "CPU Offloading cannot be enabled while TE is not present"
-                else:
-                    input_parallel.activation_offloading = self.config.cpu_offloading_activations
+        mark_te_cpu_offload_activation(self.config, input_parallel, HAVE_TE)
 
         output_parallel = self._forward_impl(
             input=input_parallel,
@@ -1736,14 +1732,7 @@ class RowParallelLinear(torch.nn.Module):
         # Matrix multiply.
         allreduce_dgrad = False
 
-        if self.config._cpu_offloading_context is not None:
-            if self.config._cpu_offloading_context.inside_context is True:
-                if not HAVE_TE:
-                    assert (
-                        self.config.cpu_offloading is False
-                    ), "CPU Offloading cannot be enabled while TE is not present"
-                else:
-                    input_parallel.activation_offloading = self.config.cpu_offloading_activations
+        mark_te_cpu_offload_activation(self.config, input_parallel, HAVE_TE)
 
         output_parallel = self._forward_impl(
             input=input_parallel,

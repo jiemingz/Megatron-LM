@@ -153,14 +153,16 @@ def assert_in_proj_recompute_preserves_norm_gate_view(
         monkeypatch.setattr(baseline.norm, "forward", contiguous_norm_forward)
 
         projection_gate_storages = []
-        in_proj_preprocess = recomputed._in_proj_preprocess
+        preprocess = recomputed._preprocess
 
-        def tracked_in_proj_preprocess(*args, **kwargs):
-            outputs = in_proj_preprocess(*args, **kwargs)
+        # ``_in_proj_preprocess`` is a hooked point, so track its inner ``_preprocess``
+        # (same z output), which runs in both the forward and the in_proj recompute.
+        def tracked_preprocess(*args, **kwargs):
+            outputs = preprocess(*args, **kwargs)
             projection_gate_storages.append(outputs[0].untyped_storage())
             return outputs
 
-        monkeypatch.setattr(recomputed, "_in_proj_preprocess", tracked_in_proj_preprocess)
+        monkeypatch.setattr(recomputed, "_preprocess", tracked_preprocess)
         saved_gates = []
         expected_gates = []
 

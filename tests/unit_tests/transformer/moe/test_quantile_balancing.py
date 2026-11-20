@@ -465,8 +465,8 @@ def test_qb_mcore_router_accumulates_microbatches_and_finalizes(fused, monkeypat
 @pytest.mark.internal
 def test_qb_router_histogram_gating_and_activation_recompute():
     """Accumulate once under recompute, but not in eval, frozen, or no-grad forwards."""
+    from megatron.core.activation_policy.recompute.checkpointing import checkpoint
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
-    from megatron.core.tensor_parallel.random import checkpoint
     from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
     from megatron.core.transformer.spec_utils import get_submodules
     from megatron.training.initialize import _set_random_seed

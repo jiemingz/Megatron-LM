@@ -413,3 +413,35 @@ def sync_checkpoint_config(args):
     run_config = get_run_config()
     run_config.checkpoint = checkpoint_config_from_args(args)
     return run_config.checkpoint
+
+
+class _ResidualReplayStack(torch.nn.Module):
+    """A layer stack for tests: ``_run_layer(index, ...)`` runs ``layers[index]`` as a stack's
+    per-layer step, which residual replay finalizes its blocks on."""
+
+    def __init__(self, layers):
+        super().__init__()
+        self.__dict__["steps"] = list(layers)  # not registered: the layers keep their owners
+
+    def _run_layer(self, index, *args, **kwargs):
+        return self.steps[index](*args, **kwargs)
+
+
+def install_residual_replay(layers, block_size=None, atomic_pairs=()):
+    """Residual-replay ``layers`` (in forward order) the way a layer stack does.
+
+    Returns the stack the ``ResidualReplayStrategy`` is installed on (``stack.replay``). Run layer
+    ``i`` as ``stack._run_layer(i, *args, **kwargs)`` for its block to be finalized when it ends
+    one; installing nothing on the stack again removes the replay hooks from the layers.
+    """
+    from megatron.core.activation_policy import (
+        ResidualReplayStrategy,
+        install_activation_strategies,
+    )
+
+    stack = _ResidualReplayStack(layers)
+    stack.__dict__["replay"] = ResidualReplayStrategy(
+        stack._run_layer, layers, block_size=block_size, atomic_pairs=atomic_pairs
+    )
+    install_activation_strategies(stack, [stack.replay])
+    return stack

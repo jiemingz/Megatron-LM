@@ -1900,6 +1900,32 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor-parallel size, got {self.tensor_model_parallel_size}."
             )
 
+    def recompute_selected(self, module_name: str) -> bool:
+        """Whether ``module_name`` is selected for selective recompute."""
+        return self.recompute_granularity == "selective" and module_name in (
+            self.recompute_modules or []
+        )
+
+    def offload_selected(self, module_name: str) -> bool:
+        """Whether ``module_name`` is selected for fine-grained activation offloading."""
+        return bool(self.fine_grained_activation_offloading) and module_name in (
+            self.offload_modules or []
+        )
+
+    def mhc_replay(self) -> bool:
+        """Whether mHC layers replay their hyper-connection ops with their recompute block."""
+        return bool(self.enable_mhc_connections) and self.recompute_selected("mhc")
+
+    def residual_stream_replay(self) -> bool:
+        """Whether wide-residual layers replay their residual reads/writes with their block."""
+        return self.recompute_selected("residual_stream")
+
+    def moe_calls_rerun_in_backward(self) -> bool:
+        """Whether each MoE layer call is rerun on its own in backward (selective ``"moe"``
+        recompute; with ``cuda_graph_impl='local'`` the partial-graph chain is rerun instead).
+        Routing replay then replays every call again."""
+        return self.recompute_selected("moe") and self.cuda_graph_impl != "local"
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -4256,6 +4282,70 @@ class TransformerConfig(ModelParallelConfig):
             isinstance(scope, CudaGraphModule) for scope in self.cuda_graph_modules
         ), f"cuda_graph_modules must be a list of CudaGraphModule, got {self.cuda_graph_modules}."
 
+        # Activation recompute / offloading that a TE CUDA graph scope cannot support (the local
+        # implementation checks its supported offload modules below).
+        graph_modules = self.cuda_graph_modules
+        is_moe = self.num_moe_experts is not None
+        te_graphs = self.cuda_graph_impl == "transformer_engine"
+        if te_graphs and self.fine_grained_activation_offloading:
+            offloaded = set(self.offload_modules or [])
+            if "attn_norm" in offloaded and CudaGraphModule.attn in graph_modules:
+                raise ValueError("attn_norm offloading is not supported with attn cudagraph.")
+            if "mlp_norm" in offloaded:
+                if is_moe:
+                    mlp_norm_ok = not (
+                        CudaGraphModule.attn in graph_modules
+                        or CudaGraphModule.moe_router in graph_modules
+                    )
+                else:
+                    # mlp_norm is the boundary of an attn or mlp graph; only whole-layer capture
+                    # supports it.
+                    mlp_norm_ok = (CudaGraphModule.attn in graph_modules) == (
+                        CudaGraphModule.mlp in graph_modules
+                    )
+                if not mlp_norm_ok:
+                    raise ValueError(
+                        "mlp_norm offloading is not supported with the current cudagraph scope."
+                    )
+        if (
+            self.recompute_granularity == "selective"
+            and "layernorm" in (self.recompute_modules or [])
+            and is_moe
+            and CudaGraphModule.moe_router in graph_modules
+            and te_graphs
+        ):
+            if (
+                self.moe_shared_expert_intermediate_size is not None
+                and self.moe_shared_expert_overlap
+            ):
+                # The shared expert takes the layernorm output as input outside the graph scope.
+                raise ValueError(
+                    "layernorm recompute is not supported with moe router cudagraph + shared "
+                    "expert overlap."
+                )
+            if not (
+                CudaGraphModule.moe_preprocess in graph_modules
+                and (self.moe_token_dispatcher_type == "alltoall" or self.moe_latent_size)
+            ):
+                # Otherwise the layernorm output is a graph output in a static buffer that cannot
+                # be released.
+                raise ValueError(
+                    "layernorm recompute with moe router cudagraph requires the moe_preprocess "
+                    "cudagraph with the alltoall token dispatcher or latent MoE."
+                )
+
+        # Recompute combinations a layer cannot run.
+        if self.inference_fuse_tp_communication and self.recompute_selected("mlp"):
+            # The fused fc2 kernel consumes the residual set on the layer as call state.
+            raise ValueError("inference_fuse_tp_communication is incompatible with mlp recompute.")
+        if self.moe_shortcut_connection and (
+            self.recompute_selected("gdn") or self.recompute_selected("gdn_norm_out")
+        ):
+            # A recomputed GDN forward cannot be split into the two stages Shortcut MoE overlaps.
+            raise ValueError(
+                "moe_shortcut_connection is incompatible with gdn and gdn_norm_out recompute."
+            )
+
         assert self.cuda_graph_impl in [
             "none",
             "transformer_engine",
@@ -4589,10 +4679,10 @@ class TransformerConfig(ModelParallelConfig):
                     "distribute_saved_activations: the segment replay does not go through "
                     "a checkpoint primitive, so the retained input is not sharded."
                 )
-                # MTP is segmented under both methods here, so unlike
-                # MultiTokenPredictionLayer._checkpointed_forward there is no 'block'
-                # exemption. The 'uniform' restriction below is config parity with that
-                # function's own assert, not a constraint of this schedule - multi-layer
+                # MTP is segmented under both methods here, so unlike the MTP layer's
+                # activation strategies (MultiTokenPredictionLayer.activation_strategies) there is
+                # no 'block' exemption. The 'uniform' restriction below is config parity with
+                # their own assert, not a constraint of this schedule - multi-layer
                 # decoder segments hand the MTP bridge over correctly.
                 if self.mtp_num_layers and self.recompute_method == "uniform":
                     assert (
@@ -5262,6 +5352,22 @@ class MLATransformerConfig(TransformerConfig):
         super().__post_init__()
         if self.attention_latent_norm_epsilon is None:
             self.attention_latent_norm_epsilon = self.layernorm_epsilon
+
+        # Fused MLA kernels a recompute of the up-projection or core attention cannot rerun.
+        if self.use_fused_mla_kv_rope_quant and (
+            self.recompute_selected("mla_up_proj") or self.recompute_selected("core_attn")
+        ):
+            raise ValueError(
+                "use_fused_mla_kv_rope_quant produces pre-quantized q/k/v that mla_up_proj and "
+                "core_attn recompute cannot rebuild; disable one of them."
+            )
+        if self.use_fused_mla_q_uproj and self.recompute_selected("core_attn"):
+            raise ValueError(
+                "use_fused_mla_q_uproj is incompatible with core_attn recompute: bf16_backward is "
+                "not threaded through the checkpointed attention path."
+            )
+        if self.cache_mla_latents and self.recompute_selected("mla_up_proj"):
+            raise ValueError("cache_mla_latents is incompatible with mla_up_proj recompute.")
 
         if (
             self.multi_latent_attention

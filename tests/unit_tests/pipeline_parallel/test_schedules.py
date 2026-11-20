@@ -38,7 +38,10 @@ def reset_dsa_loss_scale():
 
 
 def test_reset_activation_offload_uses_language_model_group(mocker):
-    reset = mocker.patch.object(schedule.off_interface, "reset")
+    from megatron.core.activation_policy.offload import session
+
+    reset = mocker.patch.object(session.FineGrainedActivationOffloadingInterface, "reset")
+    config = SimpleNamespace(fine_grained_activation_offloading=True)
     language_group = object()
     collection = MultiModuleProcessGroupCollection(
         module_pgs={
@@ -48,14 +51,19 @@ def test_reset_activation_offload_uses_language_model_group(mocker):
         },
         language_model_module_name="llm",
     )
-    schedule._reset_activation_offload(collection)
+    session.end_offload_iteration(config, collection)
     reset.assert_called_once_with(process_group=language_group)
 
     reset.reset_mock()
     collection = MultiModuleProcessGroupCollection(
         module_pgs={"encoder_1": object(), "encoder_2": object()}
     )
-    schedule._reset_activation_offload(collection)
+    session.end_offload_iteration(config, collection)
+    reset.assert_not_called()
+
+    session.end_offload_iteration(
+        SimpleNamespace(fine_grained_activation_offloading=False), collection
+    )
     reset.assert_not_called()
 
 

@@ -912,6 +912,8 @@ def test_min_memory_backend_supports_no_grad_validation_forward(monkeypatch):
                 fp8=None,
                 fp8_param=False,
                 layernorm_zero_centered_gamma=False,
+                recompute_granularity=None,
+                recompute_modules=None,
             ),
             indexer=object(),
             softmax_scale=4**-0.5,

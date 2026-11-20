@@ -9,13 +9,13 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import config
-from megatron.core.extensions.transformer_engine import HAVE_TE
-from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.tensor_parallel.random import (
+from megatron.core.activation_policy.recompute.checkpointing import (
     _mark_checkpoint_without_output_tensor,
     is_checkpoint_without_output_tensor,
 )
+from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.transformer.moe.fused_a2a import is_nccl_ep_bootstrapped, reset_hybrid_ep_buffer
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantization

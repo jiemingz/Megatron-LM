@@ -1,25 +1,22 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""The mHC adapter's ownership, selected state, and checkpoint callback contract."""
+"""The mHC adapter's ownership, selected state, and replay region contract."""
 
 import copy
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import pytest
 import torch
 from torch import nn
 
-from megatron.core.tensor_parallel.random import (
-    CheckpointWithoutOutputManager,
-    model_parallel_cuda_manual_seed,
-)
+from megatron.core.activation_policy import ReplayRegion, ResidualBranch
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.hyper_connection import (
     HyperConnectionExecutionContext,
     HyperConnectionModule,
     HyperConnectionResidualConnection,
 )
-from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.transformer_config import TransformerConfig
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, install_residual_replay
 
 
 def _model():
@@ -40,16 +37,15 @@ def _model():
     return model.to(device="cuda" if torch.cuda.is_available() else "cpu")
 
 
-def _step(model, value, bias=None, context=None, dropout=0.25):
+def _step(model, value, bias=None, dropout=0.25):
     execution = HyperConnectionExecutionContext(model.owner)
-    branch, state = model.read(value, execution_context=execution, recompute_context=context)
+    branch, state = model.read(value, execution_context=execution)
     return model.write(
         (branch.sin(), bias),
         state=state,
         dropout_probability=dropout,
         training=True,
         execution_context=execution,
-        recompute_context=context,
     )
 
 
@@ -132,62 +128,36 @@ def test_adapter_preserves_owner_selected_state_across_interleaved_reads():
         for call, (_, state) in zip(write.call_args_list, reversed(prepared)):
             assert all(a is b for a, b in zip(call.args[:3], (state[1], state[0], state[2])))
     assert calls == ["read", "read", "write", "write"]
-    for context in (None, ResidualStreamRecomputeContext(CheckpointWithoutOutputManager(), False)):
-        with pytest.raises(TypeError, match="returned branch dtype.*expected"):
-            model.read(
-                values[0],
-                branch_input_dtype=torch.float32,
-                execution_context=execution,
-                recompute_context=context,
-            )
+    with pytest.raises(TypeError, match="returned branch dtype.*expected"):
+        model.read(values[0], branch_input_dtype=torch.float32, execution_context=execution)
 
 
 @pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("layer_output", [False, True])
 @torch.compiler.set_stance("force_eager")
-def test_owner_callback_receives_flat_operands_and_bound_write_options(has_bias):
+def test_owner_points_receive_flat_operands_and_bound_write_options(has_bias, layer_output):
     owner = _model().owner
     value = torch.randn(2, 1, 32, device=next(owner.parameters()).device, requires_grad=True)
-    callback = Mock(side_effect=lambda function, *args: function(*args))
-    branch, h_res, h_post, residual = owner(value, return_residual=True, checkpoint_fn=callback)
-    bias = torch.randn(8, device=value.device) if has_bias else None
-    options = dict(dropout_prob=0.25, training=True, fused=False)
-    owner.fused_h_res_h_post_bda(
-        h_res, residual, h_post, (branch, bias), checkpoint_fn=callback, **options
-    )
-    assert callback.call_count == 2
-    assert callback.call_args_list[0].args[0] == owner.aggregate
-    function, *operands = callback.call_args.args
-    assert len(operands) == 5
-    assert all(a is b for a, b in zip(operands, (h_res, residual, h_post, branch, bias)))
-    assert function.func == owner._compute_write and function.keywords == options
-
-
-@pytest.mark.parametrize("operation", ["read", "write"])
-def test_owner_rejects_manager_and_callback_before_math(operation):
-    owner = _model().owner
-    value = torch.zeros(2, 1, 32, device=next(owner.parameters()).device)
-    manager = CheckpointWithoutOutputManager()
-    callback = Mock(side_effect=AssertionError("Conflicting callback invoked"))
+    write_name = "_h_res_h_post_bda_layer_output" if layer_output else "_h_res_h_post_bda"
+    other_name = "_h_res_h_post_bda" if layer_output else "_h_res_h_post_bda_layer_output"
     with (
-        patch.object(owner, "compute_mappings", side_effect=AssertionError("prediction")),
-        patch.object(owner, "_compute_write", side_effect=AssertionError("write")),
-        pytest.raises(ValueError),
+        patch.object(owner, "aggregate", wraps=owner.aggregate) as aggregate,
+        patch.object(owner, write_name, wraps=getattr(owner, write_name)) as write,
+        patch.object(owner, other_name, wraps=getattr(owner, other_name)) as other,
     ):
-        if operation == "read":
-            owner(value, mhc_recompute_manager=manager, checkpoint_fn=callback)
-        else:
-            owner.fused_h_res_h_post_bda(
-                value,
-                value,
-                value,
-                (value, None),
-                0.0,
-                True,
-                False,
-                manager=manager,
-                checkpoint_fn=callback,
-            )
-    callback.assert_not_called()
+        branch, h_res, h_post, residual = owner(value, return_residual=True)
+        bias = torch.randn(8, device=value.device) if has_bias else None
+        options = dict(dropout_prob=0.25, training=True, fused=False)
+        owner.fused_h_res_h_post_bda(
+            h_res, residual, h_post, (branch, bias), layer_output=layer_output, **options
+        )
+    assert aggregate.call_count == 1
+    assert write.call_count == 1 and other.call_count == 0
+    operands = write.call_args.args
+    expected = (h_res, residual, h_post, branch) + ((bias,) if has_bias else ())
+    assert len(operands) == len(expected)
+    assert all(a is b for a, b in zip(operands, expected))
+    assert write.call_args.kwargs == options
 
 
 @pytest.fixture
@@ -196,6 +166,43 @@ def gpu_model_parallel():
     model_parallel_cuda_manual_seed(123)
     yield
     Utils.destroy_model_parallel()
+
+
+class _Step(nn.Module):
+    """One replay layer: the mHC read (``aggregate``) and write, via the adapter or the owner."""
+
+    def __init__(self, model, *, through_adapter):
+        super().__init__()
+        self.__dict__["model"] = model  # not registered: the model keeps its owner
+        self.through_adapter = through_adapter
+
+    def get_residual_branches_by_layer(self):
+        owner = self.model.owner
+        read = ReplayRegion(owner, owner.aggregate)
+        write = ReplayRegion(owner, owner._h_res_h_post_bda)
+        return [[ResidualBranch(read=read, write=write)]]
+
+    def forward(self, value, bias, dropout):
+        if self.through_adapter:
+            return _step(self.model, value, bias, dropout)
+        owner = self.model.owner
+        branch, h_res, h_post, residual = owner(value, return_residual=True)
+        return owner.fused_h_res_h_post_bda(
+            h_res, residual, h_post, (branch.sin(), bias), dropout, True, False
+        )
+
+
+class _Boundary(nn.Module):
+    """A live layer output after the mHC layer: ends its replay block."""
+
+    def get_residual_branches_by_layer(self):
+        return [[ResidualBranch(write=ReplayRegion(self, self.boundary))]]
+
+    def forward(self, value):
+        return self.boundary(value)
+
+    def boundary(self, value):
+        return torch.square(value)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Output-discard replay needs CUDA")
@@ -207,14 +214,9 @@ def test_adapter_replay_matches_direct_owner(mode, dropout, gpu_model_parallel):
     reference = copy.deepcopy(actual)
     template = torch.randn(2, 1, 32, device=next(actual.parameters()).device)
     bias_template = torch.randn(8, device=template.device)
+    replay = mode != "eager"
     results = []
     for model in (reference, actual):
-        manager = None if mode == "eager" else CheckpointWithoutOutputManager()
-        context = (
-            None
-            if manager is None
-            else ResidualStreamRecomputeContext(manager, is_block_end=mode == "terminal")
-        )
         value = template.detach().clone().requires_grad_()
         bias = bias_template.detach().clone().requires_grad_()
         owner = model.owner
@@ -223,42 +225,33 @@ def test_adapter_replay_matches_direct_owner(mode, dropout, gpu_model_parallel):
             adapter.register_forward_hook(
                 lambda module, args, output: hooks.append(module.operation)
             )
+        # The reference calls the owner directly, under the same replay schedule.
+        layers = [_Step(model, through_adapter=model is actual), _Boundary()]
+        stack = (
+            install_residual_replay(layers, block_size=2 if mode == "nonterminal" else 1)
+            if replay
+            else None
+        )
+        run = stack._run_layer if replay else (lambda index, *args: layers[index](*args))
         with (
             patch.object(owner, "compute_mappings", wraps=owner.compute_mappings) as mappings,
-            patch.object(owner, "aggregate", wraps=owner.aggregate) as aggregate,
+            # The aggregate point's arithmetic (forward and replay both look it up on the owner).
+            patch.object(owner, "_h_aggregate_op", wraps=owner._h_aggregate_op) as aggregate,
             patch.object(owner, "_compute_write", wraps=owner._compute_write) as write,
         ):
             torch.manual_seed(93)
-            if model is reference:
-                # Match the legacy replay schedule; eager/replay gradient accumulation may differ.
-                branch, h_res, h_post, residual = owner(
-                    value, return_residual=True, mhc_recompute_manager=manager
-                )
-                output = owner.fused_h_res_h_post_bda(
-                    h_res,
-                    residual,
-                    h_post,
-                    (branch.sin(), bias),
-                    dropout,
-                    True,
-                    False,
-                    manager=manager if mode == "nonterminal" else None,
-                )
-            else:
-                output = _step(model, value, bias, context, dropout)
+            output = run(0, value, bias, dropout)
+            # A separate live boundary exercises both replay regions when the block goes on.
+            boundary = run(1, output)
             forward_rng = _rng()
-            boundary = output.square()
-            replay = context is not None
-            if replay:
-                assert len(context.manager.checkpoints) == 2 - int(context.is_block_end)
-                # Use a separate live boundary to exercise both selected replay regions.
-                context.manager.discard_all_outputs_and_register_unified_recompute(boundary)
-                assert bool(output.untyped_storage().nbytes()) == context.is_block_end
+            terminal = mode == "terminal"
+            # The block's last write stays live; replayed outputs are released at its end.
+            assert bool(output.untyped_storage().nbytes()) == (not replay or terminal)
             boundary.sum().backward()
-            # Projection has its own checkpoint; the mapping API is not replayed by the adapter.
+            # Projection has its own checkpoint; the mapping API is not replayed.
             assert mappings.call_count == 1
             assert aggregate.call_count == 1 + int(replay)
-            assert write.call_count == 1 + int(replay and not context.is_block_end)
+            assert write.call_count == 1 + int(replay and not terminal)
         assert hooks == (["read", "write"] if model is actual else [])
         gradients = [value.grad, bias.grad] + [p.grad for p in model.parameters()]
         assert all(gradient is not None for gradient in gradients)

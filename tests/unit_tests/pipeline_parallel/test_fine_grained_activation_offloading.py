@@ -12,21 +12,21 @@ import pytest
 import torch
 
 from megatron.core._rank_utils import safe_get_rank
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import ChunkOffloadHandler
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
+    ChunkOffloadHandler,
+)
+from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
     OffloadTensorGroup,
     OffloadTensorPool,
     PipelineOffloadManager,
 )
-from megatron.core.tensor_parallel.random import (
-    CheckpointWithoutOutput,
-    model_parallel_cuda_manual_seed,
-)
+from megatron.core.activation_policy.recompute.checkpointing import CheckpointWithoutOutput
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
@@ -330,7 +330,9 @@ def reset_hybrid_ep():
 
 
 def test_offload_summary_uses_explicit_process_group(monkeypatch):
-    from megatron.core.pipeline_parallel import fine_grained_activation_offload as off_module
+    from megatron.core.activation_policy.offload import (
+        fine_grained_activation_offload as off_module,
+    )
 
     process_group = object()
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
@@ -575,7 +577,9 @@ def _run_post_warmup_callback(chunk: ChunkOffloadHandler) -> None:
     Utils.world_size < 2, reason="Rank-0 duplicate aggregation requires at least two ranks."
 )
 def test_post_warmup_callback_warns_on_duplicated_storage_offload(caplog, monkeypatch):
-    from megatron.core.pipeline_parallel import fine_grained_activation_offload as off_module
+    from megatron.core.activation_policy.offload import (
+        fine_grained_activation_offload as off_module,
+    )
 
     # post_warmup_callback gathers the per-rank duplicate summaries, so this test needs a
     # live process group. The skipif above reads the launcher's world size rather than
@@ -695,7 +699,9 @@ def test_bulk_offload_group_counts_full_storage_and_logical_view_duplicates(full
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
 def test_bulk_offload_group_does_not_flag_views_copying_their_own_bytes(caplog, monkeypatch):
-    from megatron.core.pipeline_parallel import fine_grained_activation_offload as off_module
+    from megatron.core.activation_policy.offload import (
+        fine_grained_activation_offload as off_module,
+    )
 
     base = torch.randn(1024, 512, device="cuda")
     storage_bytes = base.numel() * base.element_size()
@@ -1101,7 +1107,7 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
         seq_length=seq_length, micro_batch_size=micro_batch_size, device=device
     )
 
-    from megatron.core.pipeline_parallel import fine_grained_activation_offload as off
+    from megatron.core.activation_policy.offload import fine_grained_activation_offload as off
 
     off_interface.reset_instance()
 
@@ -1174,7 +1180,7 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
         # Reset once more to trigger post_warmup_callback and apply steady-state offload decisions.
         off_interface.reset()
 
-        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
             PipelineOffloadManager,
         )
 
@@ -1304,7 +1310,7 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
     micro_batch_size = 2
     device = torch.device("cuda")
 
-    from megatron.core.pipeline_parallel import fine_grained_activation_offload as off
+    from megatron.core.activation_policy.offload import fine_grained_activation_offload as off
 
     def _make_schedule_inputs() -> Dict[str, torch.Tensor]:
         data = list(range(seq_length))
@@ -1457,7 +1463,7 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
             off_interface.reset()
             _run_schedule_1f1b_two_microbatches(off_model, enable_offload_reset=False)
             off_interface.reset()
-            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
                 PipelineOffloadManager,
             )
 
@@ -1538,6 +1544,11 @@ def _build_gpt_model_with_cuda_graph(
     model_parallel_cuda_manual_seed(seed)
     torch.manual_seed(seed)
     ConfigClass = MLATransformerConfig if is_mla else TransformerConfig
+    # Layernorm recompute with a captured MoE router needs the moe_preprocess graph with the
+    # alltoall dispatcher (TransformerConfig rejects it otherwise); this test uses allgather.
+    recompute_modules = [] if "moe_router" in (cuda_graph_scope or []) else ["layernorm"]
+    if num_experts is not None:
+        recompute_modules.append("moe_act")
     transformer_config = ConfigClass(
         num_layers=num_layers,
         hidden_size=hidden_size,
@@ -1547,7 +1558,7 @@ def _build_gpt_model_with_cuda_graph(
         qk_layernorm=not is_mla,
         bf16=True,
         # Recompute
-        recompute_modules=["layernorm", "moe_act"] if num_experts is not None else ["layernorm"],
+        recompute_modules=recompute_modules,
         recompute_granularity="selective",
         # MoE
         num_moe_experts=num_experts,

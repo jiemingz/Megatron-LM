@@ -9,6 +9,12 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.activation_policy import (
+    LayerCPUOffloadStrategy,
+    LayerWiseCheckpointStrategy,
+    ResidualReplayStrategy,
+)
+from megatron.core.activation_policy.offload import te_cpu
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
@@ -22,13 +28,11 @@ from megatron.core.ops.norm.torch_norm import LayerNormBuilder
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.recompute import checkpointed_forward
 from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
-from megatron.core.transformer.residual_recompute import build_residual_stream_recompute_plan
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
@@ -51,11 +55,8 @@ try:
 except ImportError:
     HAVE_APEX = False
 
-get_cpu_offload_context = None
-te_checkpoint = None
-
 if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import TENorm, get_cpu_offload_context
+    from megatron.core.extensions.transformer_engine import TENorm
 
     LayerNormImpl = TENorm
 
@@ -296,42 +297,47 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # required for pipeline parallel schedules
         self.input_tensor = None
 
-        self.checkpoint_core_attention = (
-            self.config.recompute_granularity == 'selective'
-            and "core_attn" in self.config.recompute_modules
-        )
-
-        if get_cpu_offload_context is not None:
-            self.offload_context, self.group_prefetch_offload_commit_async = (
-                get_cpu_offload_context(
-                    self.config.cpu_offloading,
-                    self.config.cpu_offloading_num_layers,
-                    self.config.num_layers,
-                    self.config.cpu_offloading_activations,
-                    self.config.cpu_offloading_weights,
-                    self.config.cpu_offloading_double_buffering,
-                    self.config.cpu_offloading_retain_pinned_cpu_buffers,
-                )
-            )
-            self.config._cpu_offloading_context = (
-                self.offload_context if self.config.cpu_offloading else None
-            )
-        else:
-            assert (
-                self.config.cpu_offloading is False
-            ), "CPU Offloading is enabled when TE is not present"
-
-            self.offload_context, self.group_prefetch_offload_commit_async = nullcontext(), None
-            self.config._cpu_offloading_context = None
-
         self.mhc_num_residual_streams = config.mhc_num_residual_streams
-        self.mhc_recompute_enabled = (
-            config.enable_mhc_connections
-            and config.recompute_granularity == 'selective'
-            and 'mhc' in config.recompute_modules
-        )
+        # How the layer stack runs (full recompute, legacy TE CPU offloading, mHC replay) is
+        # decided by its activation strategies (see activation_strategies).
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
+
+    def activation_strategies(self) -> list:
+        """Activation strategies for the layer stack."""
+        config = self.config
+        activation_strategies = []
+        if config.recompute_granularity == "full":
+            activation_strategies.append(
+                LayerWiseCheckpointStrategy(
+                    self._run_layer,
+                    self.layers,
+                    method=config.recompute_method,
+                    recompute_num_layers=config.recompute_num_layers or 0,
+                    distribute_saved_activations=bool(config.distribute_saved_activations),
+                    viewless_checkpoint_input=bool(config.enable_mhc_connections),
+                    quantized=bool(config.fp8 or config.fp4),
+                )
+            )
+        if config.mhc_replay():
+            activation_strategies.append(
+                ResidualReplayStrategy(
+                    self._run_layer, self.layers, block_size=config.mhc_recompute_layer_num
+                )
+            )
+        # Legacy TE CPU offloading of each layer. The context is also published for the linear
+        # layers without TE (see offload.te_cpu.mark_activation).
+        cpu_offload, config._cpu_offloading_context = te_cpu.build(config)
+        if cpu_offload is not None and cpu_offload.commit is not None:
+            for layer in self.layers:
+                activation_strategies.append(
+                    LayerCPUOffloadStrategy(
+                        layer,
+                        cpu_offload,
+                        unless_full_recompute=config.recompute_granularity == "full",
+                    )
+                )
+        return activation_strategies
 
     def _build_layers(self):
         # Transformer layers.
@@ -517,6 +523,51 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             return super().__call__(*args, **kwargs)[0]
         return super().__call__(*args, **kwargs)
 
+    def _run_layer(
+        self,
+        index: int,
+        hidden_states: Tensor,
+        context: Optional[Tensor],
+        *,
+        attention_mask,
+        context_mask,
+        rotary_pos_emb,
+        rotary_pos_cos,
+        rotary_pos_sin,
+        rotary_pos_cos_sin,
+        attention_bias,
+        inference_context,
+        packed_seq_params,
+        sequence_len_offset,
+        padding_mask,
+    ):
+        """Run layer ``index`` as the block does; returns ``(hidden_states, context)``.
+
+        This per-layer step is a region of the block's layer-stack strategies (full recompute,
+        mHC replay), which run it, checkpoint it or act on its output.
+        """
+        layer = self.layers[index]
+        residual_accumulator = hidden_states
+        extra_layer_kwargs = {}
+        hidden_states, context = layer(
+            hidden_states,
+            attention_mask=attention_mask,
+            context=context,
+            context_mask=context_mask,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            rotary_pos_cos_sin=rotary_pos_cos_sin,
+            attention_bias=attention_bias,
+            inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            padding_mask=padding_mask,
+            **extra_layer_kwargs,
+        )
+        observe_layer_residuals(layer, residual_accumulator, hidden_states)
+        return hidden_states, context
+
     def forward(
         self,
         hidden_states: Union[Tensor, WrappedTensor],
@@ -644,31 +695,15 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         else:
             rng_context = nullcontext()
 
-        # If fp8_recipe is delayed, wrap the entire pass with get_fp8_context(),
-        # otherwise do nothing extra at the outer level
-        # if we are using other fp8 recipes, then the context manager enter&exit are free
-        # we can wrap fp8_context within the for loop over layers, so that we can fine-grained
-        # control which layer will be fp8 or bf16
-        # For FP4: NVFP4BlockScaling doesn't have delayed scaling, always uses inner context
-        if self.config.fp8:
-            use_outer_quantization_context = self.config.fp8_recipe == Fp8Recipe.delayed
-            use_inner_quantization_context = self.config.fp8_recipe != Fp8Recipe.delayed
-            outer_quantization_context = (
-                get_fp8_context(self.config) if use_outer_quantization_context else nullcontext()
-            )
-        elif self.config.fp4:
-            use_outer_quantization_context = False
-            use_inner_quantization_context = True
-            outer_quantization_context = nullcontext()
+        # If fp8_recipe is delayed, wrap the entire pass with get_fp8_context(); other FP8
+        # recipes and FP4 are per layer: each layer enters its own context
+        # (``get_inner_quantization_context``), so which layers run in FP8/FP4 is fine-grained.
+        if self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed:
+            outer_quantization_context = get_fp8_context(self.config)
         else:
-            # No quantization
-            use_outer_quantization_context = False
-            use_inner_quantization_context = False
             outer_quantization_context = nullcontext()
 
-        # Managers retain per-forward checkpoint state, so allocate them for each training pass.
-        use_mhc_recompute = self.training and self.mhc_recompute_enabled
-        if use_mhc_recompute and len(extract_layer_indices) > 0:
+        if self.config.mhc_replay() and self.training and len(extract_layer_indices) > 0:
             # mHC recompute discards every checkpoint output in the block and restores them
             # from a single hook on the block-end tensor. A loss taken on an extracted
             # mid-block activation can reach those checkpoints before that hook fires and
@@ -679,95 +714,29 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 "recompute-block boundary, so gradients entering from an extracted "
                 "intermediate layer can reach discarded activations before they are restored."
             )
-        mhc_layer_contexts = (
-            build_residual_stream_recompute_plan(
-                num_layers=len(self.layers), block_size=self.config.mhc_recompute_layer_num
-            )
-            if use_mhc_recompute
-            else [None] * len(self.layers)
-        )
 
         with rng_context, outer_quantization_context:
-            # Forward pass.
-            if self.config.recompute_granularity == 'full' and self.training:
-                checkpointed_result = checkpointed_forward(
-                    self,
-                    hidden_states=hidden_states,
+            for l_no in range(len(self.layers)):
+                hidden_states, context = self._run_layer(
+                    l_no,
+                    hidden_states,
+                    context,
                     attention_mask=attention_mask,
-                    context=context,
                     context_mask=context_mask,
                     rotary_pos_emb=rotary_pos_emb,
+                    rotary_pos_cos=rotary_pos_cos,
+                    rotary_pos_sin=rotary_pos_sin,
+                    rotary_pos_cos_sin=rotary_pos_cos_sin,
                     attention_bias=attention_bias,
+                    inference_context=inference_context,
                     packed_seq_params=packed_seq_params,
-                    use_inner_quantization_context=use_inner_quantization_context,
+                    sequence_len_offset=sequence_len_offset,
                     padding_mask=padding_mask,
-                    extract_layer_indices=extract_layer_indices,
-                    layer_offset=layer_offset,
                 )
-                # Handle return value from _checkpointed_forward
-                if len(extract_layer_indices) > 0:
-                    # (hidden_states, intermediate_hidden_states) tuple
-                    hidden_states, intermediate_hidden_states = checkpointed_result
-                else:
-                    # No intermediate_hidden_states requested: just hidden_states
-                    hidden_states = checkpointed_result
-            else:
-                for l_no, layer in enumerate(self.layers):
-                    residual_accumulator = hidden_states
-                    # Get appropriate inner quantization context
-                    if use_inner_quantization_context:
-                        if self.config.fp8:
-                            inner_quantization_context = get_fp8_context(
-                                self.config, layer.layer_number - 1
-                            )
-                        elif self.config.fp4:
-                            inner_quantization_context = get_fp4_context(
-                                self.config, layer.layer_number - 1
-                            )
-                        else:
-                            inner_quantization_context = nullcontext()
-                    else:
-                        inner_quantization_context = nullcontext()
 
-                    mhc_context = mhc_layer_contexts[l_no]
-                    # Contexts exist only while mHC replay is active; then every layer receives
-                    # one. HyperConnectionTransformerLayer removes it before CUDA-graph dispatch.
-                    extra_layer_kwargs = (
-                        {"residual_stream_recompute_context": mhc_context}
-                        if mhc_context is not None
-                        else {}
-                    )
-                    with self.offload_context, inner_quantization_context:
-                        hidden_states, context = layer(
-                            hidden_states,
-                            attention_mask=attention_mask,
-                            context=context,
-                            context_mask=context_mask,
-                            rotary_pos_emb=rotary_pos_emb,
-                            rotary_pos_cos=rotary_pos_cos,
-                            rotary_pos_sin=rotary_pos_sin,
-                            rotary_pos_cos_sin=rotary_pos_cos_sin,
-                            attention_bias=attention_bias,
-                            inference_context=inference_context,
-                            packed_seq_params=packed_seq_params,
-                            sequence_len_offset=sequence_len_offset,
-                            padding_mask=padding_mask,
-                            **extra_layer_kwargs,
-                        )
-                    observe_layer_residuals(layer, residual_accumulator, hidden_states)
-                    if mhc_context is not None:
-                        mhc_context.finalize(hidden_states)
-
-                    if (
-                        torch.is_grad_enabled()
-                        and self.config.cpu_offloading
-                        and self.group_prefetch_offload_commit_async is not None
-                    ):
-                        hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
-
-                    # Extract intermediate embeddings using global layer index
-                    if (l_no + layer_offset) in extract_layer_indices:
-                        intermediate_hidden_states.append(hidden_states)
+                # Extract intermediate embeddings using global layer index
+                if (l_no + layer_offset) in extract_layer_indices:
+                    intermediate_hidden_states.append(hidden_states)
 
         # Only contract if the final layer norm is in this stage
         if self.config.enable_mhc_connections and self.has_final_layernorm_in_this_stage():
@@ -791,6 +760,14 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             hidden_states = hidden_states.clone()
 
         if len(extract_layer_indices) > 0:
+            # A recompute strategy may have released a layer's output once a later layer ran
+            # (it is rebuilt in backward; e.g. inside a uniform full-recompute chunk): only the
+            # outputs that are still live can be returned.
+            intermediate_hidden_states = [
+                tensor
+                for tensor in intermediate_hidden_states
+                if tensor.untyped_storage().size() > 0
+            ]
             return hidden_states, intermediate_hidden_states
 
         return hidden_states

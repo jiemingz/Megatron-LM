@@ -190,8 +190,8 @@ continue to diverge:
   methods (e.g. `_resolve_cu_seqlens`), take dev's version wholesale.
 - `model_chunk_schedule_plan.py`: Watch for missing imports (e.g.
   `CudaGraphScope`) silently dropped during conflict resolution.
-- `fine_grained_activation_offload.py`: Critical interface file used by many
-  callers. If main and dev have divergent method names/signatures, prefer
+- `fine_grained_activation_offload.py` (now under `activation_policy/offload/`): Critical
+  interface file used by many callers. If main and dev have divergent method names/signatures, prefer
   dev's implementation and patch main-originated callers to match.
 - `distrib_optimizer.py`: Dev may have broader type abstractions (e.g.
   `_is_distopt_quantized_param` covering both FP8 and GroupedQuantizedTensor).

@@ -11,6 +11,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.activation_policy import CheckpointStrategy, OffloadStrategy, TensorRef
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
@@ -21,9 +22,6 @@ from megatron.core.models.common.embeddings.rope_utils import (
 )
 from megatron.core.ops.norm.torch_norm import L2Norm, LayerNormBuilder
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    FineGrainedActivationOffloadingInterface as off_interface,
-)
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
     warn_global_process_group_fallback,
@@ -280,6 +278,22 @@ class CrossAttentionSubmodules:
     linear_proj: LinearProjBuilder
 
 
+def _reject_packed_qkv_views(config):
+    def validate(args, kwargs):
+        if config.activation_offload_fraction <= 0:
+            return
+        qkv = args[:3]
+        storages = [t.untyped_storage().data_ptr() for t in qkv]
+        if any(not t.is_contiguous() and storages.count(s) > 1 for t, s in zip(qkv, storages)):
+            raise ValueError(
+                "core_attn offloading does not support packed Q/K/V views sharing storage. "
+                "Use unpacked attention inputs or remove core_attn from offload_modules "
+                "(and attn_proj, which requires core_attn)."
+            )
+
+    return validate
+
+
 class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
     """Attention layer abstract class.
 
@@ -408,26 +422,6 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             pg_collection=self.pg_collection if self.tp_group is not None else None,
         )
 
-        self.checkpoint_core_attention = (
-            self.config.recompute_granularity == 'selective'
-            and "core_attn" in self.config.recompute_modules
-        )
-
-        self.offload_qkv_linear = (
-            self.config.fine_grained_activation_offloading
-            and "qkv_linear" in self.config.offload_modules
-        )
-
-        self.offload_core_attention = (
-            self.config.fine_grained_activation_offloading
-            and "core_attn" in self.config.offload_modules
-        )
-
-        self.offload_attn_proj = (
-            self.config.fine_grained_activation_offloading
-            and "attn_proj" in self.config.offload_modules
-        )
-
         # Output.
         self.linear_proj = submodules.linear_proj(
             self.query_projection_size,
@@ -462,6 +456,63 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
 
+    def activation_strategies(self) -> list:
+        """The QKV projection, core attention and output projection strategies (subclasses
+        override the parts that differ, see :meth:`_qkv_strategies`,
+        :meth:`_core_attention_strategies` and :meth:`_attn_proj_strategies`)."""
+        return (
+            self._qkv_strategies()
+            + self._core_attention_strategies()
+            + self._attn_proj_strategies()
+        )
+
+    def _qkv_strategies(self) -> list:
+        """Offloading of the QKV projection (point: get_query_key_value_tensors)."""
+        if not self.config.offload_selected("qkv_linear"):
+            return []
+        # Releases nothing: the layer input is the residual.
+        return [OffloadStrategy(self.get_query_key_value_tensors, "qkv_linear")]
+
+    def _core_attention_strategies(self) -> list:
+        """Recompute or offloading of core attention (point: _run_core_attention, whose inputs
+        0-2 are q, k and v)."""
+        config = self.config
+        if config.recompute_selected("core_attn"):
+            return [
+                CheckpointStrategy(
+                    self._run_core_attention, impl="tensor_parallel", training_only=True
+                )
+            ]
+        if config.offload_selected("core_attn"):
+            return [
+                OffloadStrategy(
+                    self._run_core_attention,
+                    "core_attn",
+                    release=(
+                        TensorRef.input(self._run_core_attention, 0),
+                        TensorRef.input(self._run_core_attention, 1),
+                        TensorRef.input(self._run_core_attention, 2),
+                    ),
+                    training_only=True,
+                    validate=self._core_attention_offload_validation(),
+                )
+            ]
+        return []
+
+    def _core_attention_offload_validation(self):
+        """Check of the core-attention inputs before their offload group releases them."""
+        return _reject_packed_qkv_views(self.config)
+
+    def _attn_proj_strategies(self) -> list:
+        """Offloading of the output projection's input (point: linear_proj)."""
+        if not self.config.offload_selected("attn_proj"):
+            return []
+        return [
+            OffloadStrategy(
+                self.linear_proj, "attn_proj", release=(TensorRef.input(self.linear_proj),)
+            )
+        ]
+
     def _get_core_attention_extra_kwargs(
         self,
         hidden_states: Tensor,
@@ -479,59 +530,6 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
     ) -> dict:
         """Hook for attention variants that need extra inputs in core attention."""
         return {}
-
-    def _checkpointed_attention_forward(
-        self,
-        query,
-        key,
-        value,
-        attention_mask,
-        rotary_pos_emb=None,
-        attn_mask_type=None,
-        attention_bias=None,
-        packed_seq_params=None,
-        core_attention_extra_kwargs=None,
-    ):
-        """Forward method with selective activation checkpointing."""
-        if core_attention_extra_kwargs is None:
-            core_attention_extra_kwargs = {}
-        tensor_kwarg_names = []
-        checkpoint_inputs = [query, key, value, attention_mask, rotary_pos_emb, attn_mask_type]
-        # Tensor kwargs used by custom core attention modules, such as DSA's x/qr inputs, must
-        # be passed through checkpoint so recompute sees detached checkpoint inputs instead of
-        # closing over the original forward tensors.
-        for name, kwarg_value in core_attention_extra_kwargs.items():
-            if torch.is_tensor(kwarg_value):
-                tensor_kwarg_names.append(name)
-                checkpoint_inputs.append(kwarg_value)
-
-        def custom_forward(*inputs):
-            query, key, value, attention_mask, _, attn_mask_type, *tensor_kwarg_values = inputs
-            attn_mask_type = AttnMaskType(attn_mask_type.item())
-            extra_kwargs = dict(core_attention_extra_kwargs)
-            for name, kwarg_value in zip(tensor_kwarg_names, tensor_kwarg_values):
-                extra_kwargs[name] = kwarg_value
-            output_ = self._run_core_attention(
-                query,
-                key,
-                value,
-                attention_mask,
-                attn_mask_type=attn_mask_type,
-                attention_bias=attention_bias,
-                packed_seq_params=packed_seq_params,
-                **extra_kwargs,
-            )
-            return output_
-
-        if attn_mask_type is None:
-            attn_mask_type = self.attn_mask_type
-        # Megatron's checkpoint wrapper saves only tensor args, so encode the mask enum as a
-        # tensor here and convert it back to AttnMaskType inside custom_forward.
-        attn_mask_type = torch.tensor([attn_mask_type.value], dtype=torch.int)
-        checkpoint_inputs[5] = attn_mask_type
-        hidden_states = tensor_parallel.checkpoint(custom_forward, False, *checkpoint_inputs)
-
-        return hidden_states
 
     def _run_core_attention(
         self,
@@ -1522,16 +1520,12 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 self.config.fused_single_qkv_rope and split_qkv
             ), "fused_single_qkv_rope requested but not available/supported for the config."
 
-        qkv_linear_manager = off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear")
-        with qkv_linear_manager as hidden_states:
-            qkv_output = self.get_query_key_value_tensors(
-                hidden_states,
-                key_value_states,
-                split_qkv=split_qkv,
-                output_gate=self.config.attention_output_gate,
-            )
-        # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
-        qkv_output = qkv_linear_manager.group_offload(qkv_output, forced_released_tensors=[])
+        qkv_output = self.get_query_key_value_tensors(
+            hidden_states,
+            key_value_states,
+            split_qkv=split_qkv,
+            output_gate=self.config.attention_output_gate,
+        )
         attn_mask_type = self.attn_mask_type
         block_table = None
         gate = None
@@ -1687,26 +1681,6 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         # core attention computation
         # ==================================
 
-        if (
-            self.offload_core_attention
-            and self.training
-            and self.config.activation_offload_fraction > 0
-        ):
-            # Offload may gather small views into contiguous tensors, while fused
-            # attention backward retains the packed layout selected in forward.
-            # Check the actual inputs after Q/K normalization and rotary embedding.
-            qkv = (query, key, value)
-            storages = [tensor.untyped_storage().data_ptr() for tensor in qkv]
-            if any(
-                not tensor.is_contiguous() and storages.count(storage) > 1
-                for tensor, storage in zip(qkv, storages)
-            ):
-                raise ValueError(
-                    "core_attn offloading does not support packed Q/K/V views sharing storage. "
-                    "Use unpacked attention inputs or remove core_attn from offload_modules "
-                    "(and attn_proj, which requires core_attn)."
-                )
-
         nvtx_range_push(suffix="core_attention")
         core_attention_extra_kwargs = self._get_core_attention_extra_kwargs(
             hidden_states=hidden_states,
@@ -1722,14 +1696,9 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             attn_mask_type=attn_mask_type,
             packed_seq_params=packed_seq_params,
         )
-        core_attn_manager = off_interface(
-            self.offload_core_attention and self.training, query, "core_attn"
-        )
-        if self.checkpoint_core_attention and self.training:
-            # Upstream _checkpointed_attention_forward now threads tensor-valued
-            # core-attention kwargs (e.g. DSA's x/qr) through the checkpoint, so the
-            # variant no longer has to opt out of checkpointing.
-            core_attn_out = self._checkpointed_attention_forward(
+        if inference_context is None or inference_context.is_static_batching():
+            # Static batching attention kernel.
+            core_attn_out = self._run_core_attention(
                 query,
                 key,
                 value,
@@ -1737,66 +1706,48 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 attn_mask_type=attn_mask_type,
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
-                core_attention_extra_kwargs=core_attention_extra_kwargs,
+                **core_attention_extra_kwargs,
             )
         else:
-            if inference_context is None or inference_context.is_static_batching():
-                # Static batching attention kernel.
-                with core_attn_manager as query:
-                    core_attn_out = apply_module(self.core_attention)(
-                        query,
-                        key,
-                        value,
-                        attention_mask,
-                        attn_mask_type=attn_mask_type,
-                        attention_bias=attention_bias,
-                        packed_seq_params=packed_seq_params,
-                        **core_attention_extra_kwargs,
-                    )
-
+            if core_attention_extra_kwargs:
+                core_attn_out = self._dynamic_core_attention_forward(
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                    inference_context,
+                    block_table,
+                    attn_mask_type,
+                    attention_bias,
+                    packed_seq_params,
+                    **core_attention_extra_kwargs,
+                )
             else:
-                if core_attention_extra_kwargs:
-                    core_attn_out = self._dynamic_core_attention_forward(
-                        query,
-                        key,
-                        value,
-                        attention_mask,
-                        inference_context,
-                        block_table,
-                        attn_mask_type,
-                        attention_bias,
-                        packed_seq_params,
-                        **core_attention_extra_kwargs,
-                    )
-                else:
-                    # Dynamic batching attention kernel.
-                    q, k, v = (query, key, value)
-                    cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
-                    cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
+                # Dynamic batching attention kernel.
+                q, k, v = (query, key, value)
+                cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
+                cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
 
-                    core_attn_out = self.flash_decode_and_prefill(
-                        q,
-                        k,
-                        v,
-                        max_seqlen_q,
-                        max_seqlen_k,
-                        cu_query_lengths,
-                        cu_kv_lengths,
-                        kv_lengths,
-                        block_table,
-                        inference_context.is_decode_only(),
-                        softmax_offset=self._get_inference_softmax_offset(),
-                    )
-                    core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
+                core_attn_out = self.flash_decode_and_prefill(
+                    q,
+                    k,
+                    v,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    cu_query_lengths,
+                    cu_kv_lengths,
+                    kv_lengths,
+                    block_table,
+                    inference_context.is_decode_only(),
+                    softmax_offset=self._get_inference_softmax_offset(),
+                )
+                core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
 
-                    # Clear the outputs for padding tokens when using quantization scales
-                    # to avoid corrupting amax calculations
-                    if is_using_quantization_scales(self.config):
-                        inference_context.zero_padding_tokens(core_attn_out)
+                # Clear the outputs for padding tokens when using quantization scales
+                # to avoid corrupting amax calculations
+                if is_using_quantization_scales(self.config):
+                    inference_context.zero_padding_tokens(core_attn_out)
 
-            core_attn_out = core_attn_manager.group_offload(
-                core_attn_out, forced_released_tensors=[query, key, value]
-            )
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
             # (t, np, hn) -> (t, b=1, h=np*hn)
@@ -1816,10 +1767,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
     def forward_post_core_attn(self, core_attn_out: Tensor) -> tuple[Tensor, Tensor | None]:
         """Apply the attention output projection to a core-attention result."""
         nvtx_range_push(suffix="linear_proj")
-        attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
-        with attn_proj_manager as core_attn_out:
-            output, bias = apply_module(self.linear_proj)(core_attn_out)
-        output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
+        output, bias = apply_module(self.linear_proj)(core_attn_out)
         nvtx_range_pop(suffix="linear_proj")
 
         return output, bias

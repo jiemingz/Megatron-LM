@@ -8,6 +8,11 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
+from megatron.core.activation_policy import (
+    CheckpointStrategy,
+    CheckpointWithoutOutputStrategy,
+    has_strategy,
+)
 from megatron.core.fp8_utils import get_fp8_context, is_float8tensor
 from megatron.core.models.common.embeddings.rope_utils import (
     get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
@@ -337,13 +342,15 @@ def test_kda_selective_recompute(recompute_module, two_stage_gates):
             recompute_kda, recompute_input
         )
 
-        assert base_kda.recompute_norm_out is False
-        assert base_kda.recompute_gdn is False
-        assert base_kda.norm_out_checkpoint is None
-        assert recompute_kda.recompute_norm_out is (recompute_module == "gdn_norm_out")
-        assert recompute_kda.recompute_gdn is (recompute_module == "gdn")
-        assert (recompute_kda.norm_out_checkpoint is not None) is (
-            recompute_module == "gdn_norm_out"
+        assert not has_strategy(
+            base_kda, base_kda._gated_norm_and_a2a, CheckpointWithoutOutputStrategy
+        )
+        assert not has_strategy(base_kda, base_kda._gdn_forward, CheckpointStrategy)
+        assert has_strategy(
+            recompute_kda, recompute_kda._gated_norm_and_a2a, CheckpointWithoutOutputStrategy
+        ) is (recompute_module == "gdn_norm_out")
+        assert has_strategy(recompute_kda, recompute_kda._gdn_forward, CheckpointStrategy) is (
+            recompute_module == "gdn"
         )
         # The checkpointed forward runs the fused BF16 recurrence under no_grad, which can
         # select a different reduction path from the eager forward.  Keep this to one BF16

@@ -948,14 +948,13 @@ def test_output_rope_is_delegated_to_fused_core_once(monkeypatch, packed):
         rotary_pos_emb=SimpleNamespace(get_cached_cos_sin=cache),
         get_query_key_value_tensors=lambda *_args, **_kwargs: (hidden, hidden, hidden, None, None),
         core_attention=core,
-        offload_core_attention=False,
-        offload_attn_proj=False,
         training=True,
-        recompute_up_proj=False,
         output_projection_local_groups=1,
         linear_o_group_proj=torch.eye(4),
         linear_proj=lambda x: (x, None),
     )
+    for region_fn in ("_run_dsv4_core_attention", "_output_rope_and_group_proj"):
+        setattr(model, region_fn, partial(getattr(hybrid.DSv4HybridAttention, region_fn), model))
     output, _ = hybrid.DSv4HybridAttention.forward(model, hidden, None, packed_seq_params=params)
     torch.testing.assert_close(output, hidden * 3)
     output.sum().backward()

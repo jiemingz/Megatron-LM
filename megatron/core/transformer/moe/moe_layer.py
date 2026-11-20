@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Protocol
@@ -9,6 +10,7 @@ from typing import Optional, Protocol
 import torch
 
 from megatron.core import utils
+from megatron.core.activation_policy import CheckpointStrategy
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
@@ -49,7 +51,6 @@ from megatron.core.transformer.moe.training_matches_inference import (
 )
 from megatron.core.transformer.moe.virtual_expert_load_balancer import VirtualExpertLoadBalancer
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import precision_aware_checkpoint
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
 
@@ -243,12 +244,39 @@ class BaseMoELayer(MegatronModule, ABC):
         self.router.set_layer_number(layer_number)
 
 
+def _shared_experts_save_original_input(shared_experts) -> None:
+    """FP8/FP4: make the shared-expert fc1 save its original input instead of a quantized copy.
+
+    The pre_mlp_layernorm output is saved by the router; without this the shared expert fc1
+    would also save its quantized copy. A checkpointed shared expert saves nothing inside.
+    """
+    from megatron.core.extensions.transformer_engine import HAVE_TE
+    from megatron.core.utils import is_te_min_version
+
+    if not HAVE_TE:
+        return
+    config = shared_experts.config
+    if not (
+        (config.fp8 and config.fp8_recipe != 'delayed' and is_te_min_version("2.6.0dev0"))
+        or (config.fp4 and is_te_min_version("2.7.0.dev0"))
+    ):
+        return
+    from megatron.core.extensions.transformer_engine import TELinear, set_save_original_input
+
+    if isinstance(shared_experts.linear_fc1, TELinear):
+        set_save_original_input(shared_experts.linear_fc1)
+
+
 class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
     """Mixture of Experts layer.
 
     This layer implements a Mixture of Experts model, where each token is routed to a
     subset of experts. This implementation supports different token dispatching
     strategies such as All-to-All and All-Gather.
+
+    Activation regions (see ``MoELayer.activation_strategies``): ``moe`` (the
+    whole routed forward, or the megakernel forward) and ``shared_experts`` (the non-overlapped
+    shared-expert call).
     """
 
     @classmethod
@@ -303,17 +331,7 @@ class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
             pg_collection=pg_collection,
             is_mtp_layer=is_mtp_layer,
         )
-        # If using mcore cudagraphs, recompute is handled by transformer_layer.MoETransformerLayer
-        self.moe_layer_recompute = (
-            config.recompute_granularity == 'selective'
-            and "moe" in config.recompute_modules
-            and config.cuda_graph_impl != 'local'
-        )
-        self.shared_experts_recompute = (
-            config.recompute_granularity == 'selective'
-            and "shared_experts" in config.recompute_modules
-        )
-
+        self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
 
         # Initialize router.
@@ -508,6 +526,32 @@ class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
         # Setup events and streams for delayed wgrad computation.
         self.setup_delayed_wgrad_for_dispatch_backward_overlap()
 
+        shared_experts = getattr(self, "shared_experts", None)
+        # Decided on the shared experts' own (deep-copied) config, as SharedExpertMLP did.
+        if shared_experts is not None and not shared_experts.config.recompute_selected(
+            "shared_experts"
+        ):
+            _shared_experts_save_original_input(shared_experts)
+
+    def activation_strategies(self) -> list:
+        """Activation strategies (points: _moe_forward / _megakernel_forward, the routed or
+        megakernel forward; shared_experts, the shared-expert module)."""
+        config = self.config
+        activation_strategies = []
+        if config.moe_calls_rerun_in_backward():
+            # With cuda_graph_impl='local', MoETransformerLayer checkpoints the partial-graph
+            # chain (moe_partial_cudagraphs) instead.
+            moe_forward = (
+                self._megakernel_forward
+                if config.moe_megakernel_backend is not None
+                else self._moe_forward
+            )
+            activation_strategies.append(CheckpointStrategy(moe_forward, training_only=True))
+        shared_experts = getattr(self, "shared_experts", None)
+        if config.recompute_selected("shared_experts") and shared_experts is not None:
+            activation_strategies.append(CheckpointStrategy(shared_experts))
+        return activation_strategies
+
     def _setup_inference_mode(self, pg_collection):
         """Set up inference-optimized token dispatcher.
 
@@ -683,12 +727,7 @@ class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
         shared_expert_output = None
         if self.use_shared_expert and not self.shared_expert_overlap:
             # Compute the shared expert separately when not overlapped with communication.
-            if self.shared_experts_recompute:
-                shared_expert_output = precision_aware_checkpoint(
-                    apply_module(self.shared_experts), self.config, self.tp_group, hidden_states
-                )
-            else:
-                shared_expert_output = apply_module(self.shared_experts)(hidden_states)
+            shared_expert_output = apply_module(self.shared_experts)(hidden_states)
 
         return shared_expert_output
 
@@ -818,106 +857,132 @@ class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
                     "CUDA-graph capture; remove moe_router/moe_preprocess from cuda_graph_modules"
                 )
 
-            def megakernel_forward(hidden_states, padding_mask):
+            output = self._megakernel_forward(
+                hidden_states,
+                padding_mask,
+                input_ids,
+                replay_topk_idx,
+                packed_seq_params=packed_seq_params,
+            )
+            return output, None
+
+        # MoE forward: route -> dispatch -> compute -> combine
+        if self.config.moe_training_matches_inference and not InferenceMode.is_active():
+            # Not an activation policy: the value pass and the training forward are different
+            # functions and the checkpoint joining them is the mechanism itself, so it runs the
+            # MoE computation itself rather than the _moe_forward call.
+            training_forward = functools.partial(
+                self._moe_compute,
+                input_ids=input_ids,
+                replay_topk_idx=replay_topk_idx,
+                packed_seq_params=packed_seq_params,
+            )
+            return training_matches_inference_forward(
+                self, training_forward, hidden_states, intermediate_tensors, padding_mask, input_ids
+            )
+
+        return self._moe_forward(
+            hidden_states,
+            intermediate_tensors,
+            padding_mask,
+            input_ids,
+            replay_topk_idx,
+            packed_seq_params=packed_seq_params,
+        )
+
+    def _megakernel_forward(
+        self,
+        hidden_states: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
+        replay_topk_idx: Optional[torch.Tensor] = None,
+        *,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ):
+        """Route and run the megakernel experts (the whole MoE layer call)."""
+        probs, routing_map = self.route(
+            hidden_states,
+            padding_mask,
+            input_ids,
+            packed_seq_params=packed_seq_params,
+            replay_topk_idx=replay_topk_idx,
+        )
+        return apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
+
+    def _moe_forward(self, *args, **kwargs):
+        """The MoE call of :meth:`forward` (see :meth:`_moe_compute`)."""
+        return self._moe_compute(*args, **kwargs)
+
+    def _moe_compute(
+        self,
+        hidden_states: torch.Tensor,
+        intermediate_tensors=None,
+        padding_mask: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
+        replay_topk_idx: Optional[torch.Tensor] = None,
+        *,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ):
+        """MoE forward: route -> dispatch -> compute -> combine (see :meth:`forward`)."""
+        shared_expert_output = None
+        try:
+            if "route" in self.fwd_execution_map:
+                # preprocess rebinds hidden_states to the dispatch input (latent, flattened);
+                # the shared experts always consume the layer input.
+                layer_input = hidden_states
+                if not self.run_shared_experts_after_router:
+                    shared_expert_output = self.shared_experts_compute(layer_input)
+
                 probs, routing_map = self.route(
-                    hidden_states,
+                    layer_input,
                     padding_mask,
                     input_ids,
                     packed_seq_params=packed_seq_params,
                     replay_topk_idx=replay_topk_idx,
                 )
-                return apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
-
-            if self.moe_layer_recompute and self.training:
-                output = precision_aware_checkpoint(
-                    megakernel_forward, self.config, self.tp_group, hidden_states, padding_mask
+                hidden_states, probs = self.preprocess(
+                    layer_input,
+                    probs,
+                    routing_map,
+                    padding_mask,
+                    packed_seq_params=packed_seq_params,
                 )
-            else:
-                output = megakernel_forward(hidden_states, padding_mask)
-            return output, None
 
-        # MoE forward: route -> dispatch -> compute -> combine
-        def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
-            shared_expert_output = None
-            try:
-                if "route" in self.fwd_execution_map:
-                    # preprocess rebinds hidden_states to the dispatch input (latent, flattened);
-                    # the shared experts always consume the layer input.
-                    layer_input = hidden_states
-                    if not self.run_shared_experts_after_router:
-                        shared_expert_output = self.shared_experts_compute(layer_input)
-
-                    probs, routing_map = self.route(
-                        layer_input,
-                        padding_mask,
-                        input_ids,
-                        packed_seq_params=packed_seq_params,
-                        replay_topk_idx=replay_topk_idx,
-                    )
-                    hidden_states, probs = self.preprocess(
-                        layer_input,
-                        probs,
-                        routing_map,
-                        padding_mask,
-                        packed_seq_params=packed_seq_params,
-                    )
-
-                    if self.run_shared_experts_after_router:
-                        shared_expert_output = self.shared_experts_compute(layer_input)
-                    if intermediate_tensors is not None:
-                        return hidden_states, probs, shared_expert_output
-
-            except TEMoECudaGraphPartialCaptureSignal as e:
-                # This signal is raised from the
-                # maybe_skip_or_early_return_by_te_cuda_graph decorator.
-                # It means we should early-return from the MoE layer forward pass.
-                # This happens when we are partially capturing the CUDA graph of the MoE layer,
-                # like cuda_graph_modules=["moe_router", "moe_preprocess"].
-                # We need to return the intermediate tensors as CUDA graph outputs.
-                return e.get_early_return_outputs(hidden_states, shared_expert_output)
-
-            if "expert_compute" in self.fwd_execution_map:
+                if self.run_shared_experts_after_router:
+                    shared_expert_output = self.shared_experts_compute(layer_input)
                 if intermediate_tensors is not None:
-                    hidden_states, probs = intermediate_tensors
+                    return hidden_states, probs, shared_expert_output
 
-                output, mlp_bias = self.routed_experts_compute(*self.dispatch(hidden_states, probs))
-                assert (
-                    mlp_bias is None
-                ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
-                output = self.combine(output)
+        except TEMoECudaGraphPartialCaptureSignal as e:
+            # This signal is raised from the
+            # maybe_skip_or_early_return_by_te_cuda_graph decorator.
+            # It means we should early-return from the MoE layer forward pass.
+            # This happens when we are partially capturing the CUDA graph of the MoE layer,
+            # like cuda_graph_modules=["moe_router", "moe_preprocess"].
+            # We need to return the intermediate tensors as CUDA graph outputs.
+            return e.get_early_return_outputs(hidden_states, shared_expert_output)
 
-                if intermediate_tensors is not None:
-                    return output, mlp_bias
+        if "expert_compute" in self.fwd_execution_map:
+            if intermediate_tensors is not None:
+                hidden_states, probs = intermediate_tensors
 
-            if "postprocess" in self.fwd_execution_map:
-                if intermediate_tensors is not None:
-                    output, shared_expert_output = intermediate_tensors
+            output, mlp_bias = self.routed_experts_compute(*self.dispatch(hidden_states, probs))
+            assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+            output = self.combine(output)
 
-                output = self.postprocess(output, shared_expert_output)
+            if intermediate_tensors is not None:
+                return output, mlp_bias
 
-                if intermediate_tensors is not None:
-                    return output
+        if "postprocess" in self.fwd_execution_map:
+            if intermediate_tensors is not None:
+                output, shared_expert_output = intermediate_tensors
 
-            return output, mlp_bias
+            output = self.postprocess(output, shared_expert_output)
 
-        if self.config.moe_training_matches_inference and not InferenceMode.is_active():
-            return training_matches_inference_forward(
-                self, custom_forward, hidden_states, intermediate_tensors, padding_mask, input_ids
-            )
+            if intermediate_tensors is not None:
+                return output
 
-        if self.moe_layer_recompute and self.training:
-            outputs = precision_aware_checkpoint(
-                custom_forward,
-                self.config,
-                self.tp_group,
-                hidden_states,
-                intermediate_tensors,
-                padding_mask,
-            )
-        else:
-            outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
-
-        return outputs
+        return output, mlp_bias
 
     def backward_dw(self, routed_experts: bool = True, shared_experts: bool = False):
         """Compute weight gradients for experts and shared experts."""
@@ -943,9 +1008,9 @@ class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
 
     def set_for_recompute_pre_mlp_layernorm(self):
         """Set the MoE layer for recompute pre_mlp_layernorm. Only needed for fp8/fp4."""
-        # If shared_experts_recompute is used, nothing needs to be done because the checkpoint
+        # If the shared experts are checkpointed, nothing needs to be done because the checkpoint
         # function will save the original input tensors.
-        if self.shared_experts is not None and not self.shared_experts_recompute:
+        if self.shared_experts is not None and not self.config.recompute_selected("shared_experts"):
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
             set_save_original_input(self.shared_experts.linear_fc1)

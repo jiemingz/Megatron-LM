@@ -7,12 +7,10 @@
 
 import logging
 import math
-from functools import partial
 
 import torch
 import torch.nn.functional as F
 
-from megatron.core import tensor_parallel
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
@@ -349,29 +347,16 @@ class GatedDeltaNet2(_GDNBase):
         )
         nvtx_range_pop(suffix="gated_delta_rule")
 
-        if self.recompute_norm_out:
-            self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            norm_func = partial(
-                self._gated_norm_and_a2a,
-                thd_cp_a2a_inv=thd_cp_a2a_inv,
-                batch=batch,
-                seq_len=seq_len,
-                cp_size=cp_size,
-                cp_group=cp_group,
-                packed_seq_params=packed_seq_params,
-            )
-            norm_out = self.norm_out_checkpoint.checkpoint(norm_func, core_attn_out, gate)
-        else:
-            norm_out = self._gated_norm_and_a2a(
-                core_attn_out,
-                gate,
-                thd_cp_a2a_inv,
-                batch,
-                seq_len,
-                cp_size,
-                cp_group,
-                packed_seq_params,
-            )
+        norm_out = self._gated_norm_and_a2a(
+            core_attn_out,
+            gate,
+            thd_cp_a2a_inv=thd_cp_a2a_inv,
+            batch=batch,
+            seq_len=seq_len,
+            cp_size=cp_size,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+        )
 
         return norm_out
 

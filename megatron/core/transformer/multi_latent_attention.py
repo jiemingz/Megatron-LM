@@ -16,7 +16,12 @@ try:
 except ImportError:
     HAVE_EINOPS = False
 
-from megatron.core import tensor_parallel
+from megatron.core.activation_policy import (
+    CheckpointWithoutOutputStrategy,
+    Event,
+    OffloadStrategy,
+    TensorRef,
+)
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_row_copy import contiguous_rows
@@ -28,9 +33,6 @@ from megatron.core.models.common.embeddings import (
 )
 from megatron.core.ops.norm.torch_norm import LayerNormBuilder
 from megatron.core.packed_seq_params import resolve_cp_group
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    FineGrainedActivationOffloadingInterface as off_interface,
-)
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
     warn_global_process_group_fallback,
@@ -316,12 +318,6 @@ class MultiLatentAttention(Attention):
         self.key_hidden_size = self.q_head_dim
         self.val_hidden_size = self.config.v_head_dim
 
-        self.recompute_up_proj = (
-            self.config.recompute_granularity == 'selective'
-            and "mla_up_proj" in self.config.recompute_modules
-        )
-        self.qkv_up_checkpoint = None
-
         # Fused MLA Q up-proj+rope+quant via cuDNN gemm_proj_rope_mxfp8.
         # The q_layernorm is absorbed into the fusion so that MXFP8 is produced in one step
         # from the norm's FP32 accumulator, as TELayerNormColumnParallelLinear does; that
@@ -435,6 +431,37 @@ class MultiLatentAttention(Attention):
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
 
+    def activation_strategies(self) -> list:
+        """Attention's, plus the Q/KV up-projection recompute (point: _qkv_up_proj_and_rope, the
+        up projections and RoPE nested in _qkv_linear_region)."""
+        activation_strategies = super().activation_strategies()
+        if self.config.recompute_selected("mla_up_proj"):
+            # q/k/v are discarded once core attention consumed them and rebuilt from the gradient
+            # of the core attention output (the attn_proj input).
+            activation_strategies.append(
+                CheckpointWithoutOutputStrategy(
+                    self._qkv_up_proj_and_rope, release_on=Event(self.linear_proj, "enter")
+                )
+            )
+        return activation_strategies
+
+    def _qkv_strategies(self) -> list:
+        """Offloading of the down projections (point: _qkv_linear_region). Unlike Attention, it
+        releases the layer input. (Core attention may run on pre-quantized q/k/v; the runtime
+        never releases quantized tensors.)"""
+        if not self.config.offload_selected("qkv_linear"):
+            return []
+        return [
+            OffloadStrategy(
+                self._qkv_linear_region,
+                "qkv_linear",
+                release=(TensorRef.input(self._qkv_linear_region),),
+            )
+        ]
+
+    def _core_attention_offload_validation(self):
+        return None
+
     def _run_core_attention(
         self,
         query,
@@ -529,16 +556,13 @@ class MultiLatentAttention(Attention):
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
         # query: [96, 1, 16, 128], key:[96, 1, 16, 128], value:[96, 1, 16, 128]
-        qkv_linear_manager = off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear")
-        with qkv_linear_manager as hidden_states:
-            query, key, value, q_compressed, kv_compressed = self.get_query_key_value_tensors(
-                hidden_states,
-                key_value_states,
-                position_ids,
-                packed_seq_params,
-                inference_context=inference_context,
-            )
-        query = qkv_linear_manager.group_offload(query, forced_released_tensors=[hidden_states])
+        query, key, value, q_compressed, kv_compressed, hidden_states = self._qkv_linear_region(
+            hidden_states,
+            key_value_states,
+            position_ids,
+            packed_seq_params,
+            inference_context=inference_context,
+        )
 
         # ===================================================
         # Adjust key, value for inference
@@ -573,72 +597,44 @@ class MultiLatentAttention(Attention):
         # ==================================
         # core attention computation
         # ==================================
-        # Need corresponding TE change
-        core_attn_manager = off_interface(
-            self.offload_core_attention and self.training, query, "core_attn"
-        )
         needs_output_trim = False
         orig_v_dim = None
         padded_v_dim = None
-        if self.checkpoint_core_attention and self.training:
-            assert not self._use_fused_q_uproj, (
-                "use_fused_mla_q_uproj is incompatible with checkpoint_core_attention: "
-                "bf16_backward is not threaded through the checkpointed attention path. "
-                "Disable one of them."
-            )
-            core_attn_out = self._checkpointed_attention_forward(
+        if inference_context is None or inference_context.is_static_batching():
+            core_attn_out = self._run_core_attention(
                 query,
                 key,
                 value,
                 attention_mask,
                 packed_seq_params=packed_seq_params,
-                core_attention_extra_kwargs=core_attention_extra_kwargs,
+                attn_mask_type=attn_mask_type,
+                **core_attention_extra_kwargs,
             )
-        else:
-            if inference_context is None or inference_context.is_static_batching():
-                with core_attn_manager as query:
-                    core_attn_out = self._run_core_attention(
-                        query,
-                        key,
-                        value,
-                        attention_mask,
-                        packed_seq_params=packed_seq_params,
-                        attn_mask_type=attn_mask_type,
-                        **core_attention_extra_kwargs,
-                    )
-            elif self.cache_mla_latents:
-                value, need_v_pad, orig_v_dim, padded_v_dim = _prepare_mla_core_attention_value(
-                    self, query, value, packed_seq_params
-                )
-                # Dynamic batching attention kernel.
-                q, k, v = (query, key, value)
-                cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
-                cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
+        elif self.cache_mla_latents:
+            value, need_v_pad, orig_v_dim, padded_v_dim = _prepare_mla_core_attention_value(
+                self, query, value, packed_seq_params
+            )
+            # Dynamic batching attention kernel.
+            q, k, v = (query, key, value)
+            cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
+            cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
 
-                core_attn_out = self.flash_decode_and_prefill(
-                    q,
-                    k,
-                    v,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    cu_query_lengths,
-                    cu_kv_lengths,
-                    kv_lengths,
-                    block_table,
-                    inference_context.is_decode_only(),
-                )
-                # Only rearrange if not in absorption mode (Flash MLA handles format correctly)
-                if not inference_context.is_decode_only():
-                    core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
-                needs_output_trim = need_v_pad
-            forced = [
-                t
-                for t in [query, key, value]
-                if t is not None and not isinstance(t, QuantizedTensor)
-            ]
-            core_attn_out = core_attn_manager.group_offload(
-                core_attn_out, forced_released_tensors=forced
+            core_attn_out = self.flash_decode_and_prefill(
+                q,
+                k,
+                v,
+                max_seqlen_q,
+                max_seqlen_k,
+                cu_query_lengths,
+                cu_kv_lengths,
+                kv_lengths,
+                block_table,
+                inference_context.is_decode_only(),
             )
+            # Only rearrange if not in absorption mode (Flash MLA handles format correctly)
+            if not inference_context.is_decode_only():
+                core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
+            needs_output_trim = need_v_pad
 
         # We are doing absorption with cache mla latents and decode mode.
         if self.cache_mla_latents and inference_context.is_decode_only():
@@ -661,20 +657,20 @@ class MultiLatentAttention(Attention):
             # note that batch is a dummy dimension in the packed case
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
 
-        if self.recompute_up_proj:
-            assert self.qkv_up_checkpoint is not None
-            self.qkv_up_checkpoint.discard_output_and_register_recompute(core_attn_out)
-            self.qkv_up_checkpoint = None
-
         # =================
         # Output. [sq, b, h]
         # =================
-        attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
-        with attn_proj_manager as core_attn_out:
-            output, bias = apply_module(self.linear_proj)(core_attn_out)
-        output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
+        output, bias = apply_module(self.linear_proj)(core_attn_out)
 
         return output, bias
+
+    def _qkv_linear_region(self, hidden_states, *args, **kwargs):
+        """The Q/K/V projections, also returning ``hidden_states``.
+
+        ``hidden_states`` is returned as the region saw it (after an offload group start, if
+        any), because the DSA core attention consumes it as ``x``.
+        """
+        return (*self.get_query_key_value_tensors(hidden_states, *args, **kwargs), hidden_states)
 
 
 class MLASelfAttention(MultiLatentAttention):
@@ -1108,243 +1104,260 @@ class MLASelfAttention(MultiLatentAttention):
 
             return query, key, value
 
-        def qkv_up_proj_and_rope_apply(q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb):
-            """
-            Apply the up projection and RoPE to the query and key.
-            When sequence packing enabled, the input tensors adopt a packed shape of [t, ...];
-            otherwise, they maintain the unpacked shape [s, b, ...]. In subsequent code comments,
-            we uniformly use [num_tokens, ...] to denote [s, b, ...] or [t, ...] for two cases.
-            """
-            use_fused_q_uproj = (
-                self._use_fused_q_uproj
-                and self.config.apply_rope_fusion
-                and self.config.q_lora_rank is not None
-                and q_compressed.ndim == 3
-                and runtime_cp_group.size() == 1
+        if self.cache_mla_latents:
+            assert (
+                inference_context and not inference_context.is_static_batching()
+            ), "Caching MLA latents only works with dynamic backend inference"
+            query, key, value = qkv_up_proj_and_rope_apply_for_cached_latent_kv(
+                q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
+            )
+        else:
+            query, key, value = self._qkv_up_proj_and_rope(
+                q_compressed,
+                kv_compressed,
+                k_pos_emb,
+                rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                mscale=mscale,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_kv,
+                rope_freqs_max_seqlen=rope_freqs_max_seqlen,
+                runtime_cp_group=runtime_cp_group,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
             )
 
-            if use_fused_q_uproj:
-                b = q_compressed.shape[1]
+        return query, key, value, q_compressed, kv_compressed
 
-                # With sequence parallelism the input is sequence-split; gather to full
-                # sequence before the fused kernel, which owns the norm.
-                if self.config.sequence_parallel and get_pg_size(self.tp_group) > 1:
-                    q_compressed = gather_from_sequence_parallel_region(
-                        q_compressed, group=self.tp_group
-                    )
-                s = q_compressed.shape[0]
+    def _qkv_up_proj_and_rope(
+        self,
+        q_compressed,
+        kv_compressed,
+        k_pos_emb,
+        rotary_pos_emb,
+        *,
+        rotary_pos_cos,
+        rotary_pos_sin,
+        mscale,
+        cu_seqlens_q,
+        cu_seqlens_kv,
+        rope_freqs_max_seqlen,
+        runtime_cp_group,
+        inference_context,
+        packed_seq_params,
+    ):
+        """
+        Apply the up projection and RoPE to the query and key.
+        When sequence packing enabled, the input tensors adopt a packed shape of [t, ...];
+        otherwise, they maintain the unpacked shape [s, b, ...]. In subsequent code comments,
+        we uniformly use [num_tokens, ...] to denote [s, b, ...] or [t, ...] for two cases.
+        """
+        use_fused_q_uproj = (
+            self._use_fused_q_uproj
+            and self.config.apply_rope_fusion
+            and self.config.q_lora_rank is not None
+            and q_compressed.ndim == 3
+            and runtime_cp_group.size() == 1
+        )
 
-                query = FusedMLAQUpProjFunction.apply(
-                    q_compressed,
-                    self.linear_q_up_proj.layer_norm_weight,
-                    self.linear_q_up_proj.weight,
-                    rotary_pos_cos,
-                    rotary_pos_sin,
-                    self.linear_q_up_proj.wgrad_store,
-                    getattr(self.linear_q_up_proj, "fuse_wgrad_accumulation", False),
-                    self.num_attention_heads_per_partition,
-                    self.q_head_dim,
-                    self.config.qk_head_dim,
-                    self.config.qk_pos_emb_head_dim,
-                    s,
-                    b,
-                    self.tp_group,
-                    self.config.sequence_parallel,
-                    self.config.layernorm_epsilon,
-                    self.config.normalization,
-                    self.config.layernorm_zero_centered_gamma,
+        if use_fused_q_uproj:
+            b = q_compressed.shape[1]
+
+            # With sequence parallelism the input is sequence-split; gather to full
+            # sequence before the fused kernel, which owns the norm.
+            if self.config.sequence_parallel and get_pg_size(self.tp_group) > 1:
+                q_compressed = gather_from_sequence_parallel_region(
+                    q_compressed, group=self.tp_group
                 )
-            else:
-                if self.config.q_lora_rank is not None:
-                    # q_compressed: [num_tokens, q_lora_rank]
-                    # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
-                    q, _ = self.linear_q_up_proj(
-                        _up_proj_input(self.linear_q_up_proj, q_compressed)
-                    )
-                else:
-                    # q_compressed: [num_tokens, hidden_size]
-                    # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
-                    q, _ = self.linear_q_proj(q_compressed)
+            s = q_compressed.shape[0]
 
-                # q: [num_tokens, n, q_head_dim]
-                q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
-
-            # kv: [num_tokens, n * (qk_head_dim + v_head_dim)]
-            kv, _ = self.linear_kv_up_proj(_up_proj_input(self.linear_kv_up_proj, kv_compressed))
-
-            # kv: [num_tokens, n, (qk_head_dim + v_head_dim)]
-            kv = kv.view(
-                *kv.size()[:-1],
+            query = FusedMLAQUpProjFunction.apply(
+                q_compressed,
+                self.linear_q_up_proj.layer_norm_weight,
+                self.linear_q_up_proj.weight,
+                rotary_pos_cos,
+                rotary_pos_sin,
+                self.linear_q_up_proj.wgrad_store,
+                getattr(self.linear_q_up_proj, "fuse_wgrad_accumulation", False),
                 self.num_attention_heads_per_partition,
-                self.config.qk_head_dim + self.config.v_head_dim,
+                self.q_head_dim,
+                self.config.qk_head_dim,
+                self.config.qk_pos_emb_head_dim,
+                s,
+                b,
+                self.tp_group,
+                self.config.sequence_parallel,
+                self.config.layernorm_epsilon,
+                self.config.normalization,
+                self.config.layernorm_zero_centered_gamma,
             )
+        else:
+            if self.config.q_lora_rank is not None:
+                # q_compressed: [num_tokens, q_lora_rank]
+                # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
+                q, _ = self.linear_q_up_proj(_up_proj_input(self.linear_q_up_proj, q_compressed))
+            else:
+                # q_compressed: [num_tokens, hidden_size]
+                # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
+                q, _ = self.linear_q_proj(q_compressed)
 
-            # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
-            k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
+            # q: [num_tokens, n, q_head_dim]
+            q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
 
-            use_fused_kv_rope_quant = (
-                self._use_fused_kv_rope_quant
-                and self.training
-                and self.config.apply_rope_fusion
-                and not self.recompute_up_proj
-                and not self.checkpoint_core_attention
-                and kv.ndim == 4
-                and cu_seqlens_kv is None
-                and runtime_cp_group.size() == 1
-                and kv.shape[0] % 128 == 0
-                and kv.dtype == torch.bfloat16
-                and k_pos_emb.dtype == torch.bfloat16
-                and _is_mxfp8_attention_active()
-            )
-            if use_fused_kv_rope_quant:
-                # RoPE'd q quantized as attention would; k and v split, RoPE'd and quantized in
-                # one kernel. Same MXFP8 q/k/v as the unfused path gives attention.
-                if use_fused_q_uproj:
-                    quantized_query = query
-                else:
-                    quantized_query = _QuantizeQueryForFusedAttn.apply(
-                        fused_apply_mla_rope_for_q(
-                            q,
-                            rotary_pos_cos,
-                            rotary_pos_sin,
-                            self.config.qk_head_dim,
-                            self.config.qk_pos_emb_head_dim,
-                        )
-                    )
-                key, value = _FusedKVRoPEQuantForFusedAttn.apply(
-                    kv,
-                    k_pos_emb,
-                    rotary_pos_cos,
-                    rotary_pos_sin,
-                    self.config.qk_pos_emb_head_dim,
-                    self.config.qk_head_dim,
-                    self.config.v_head_dim,
-                )
-                mxfp8_transpose_swizzle([quantized_query, key, value], "sbhd")
-                return quantized_query, key, value
+        # kv: [num_tokens, n * (qk_head_dim + v_head_dim)]
+        kv, _ = self.linear_kv_up_proj(_up_proj_input(self.linear_kv_up_proj, kv_compressed))
 
-            # todo add assert about fusions and caching
-            if self.config.apply_rope_fusion:
-                cp_rank = runtime_cp_group.rank()
-                cp_size = runtime_cp_group.size()
-                if not use_fused_q_uproj:
-                    query = fused_apply_mla_rope_for_q(
+        # kv: [num_tokens, n, (qk_head_dim + v_head_dim)]
+        kv = kv.view(
+            *kv.size()[:-1],
+            self.num_attention_heads_per_partition,
+            self.config.qk_head_dim + self.config.v_head_dim,
+        )
+
+        # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
+        k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
+
+        use_fused_kv_rope_quant = (
+            self._use_fused_kv_rope_quant
+            and self.training
+            and self.config.apply_rope_fusion
+            and kv.ndim == 4
+            and cu_seqlens_kv is None
+            and runtime_cp_group.size() == 1
+            and kv.shape[0] % 128 == 0
+            and kv.dtype == torch.bfloat16
+            and k_pos_emb.dtype == torch.bfloat16
+            and _is_mxfp8_attention_active()
+        )
+        if use_fused_kv_rope_quant:
+            # RoPE'd q quantized as attention would; k and v split, RoPE'd and quantized in
+            # one kernel. Same MXFP8 q/k/v as the unfused path gives attention.
+            if use_fused_q_uproj:
+                quantized_query = query
+            else:
+                quantized_query = _QuantizeQueryForFusedAttn.apply(
+                    fused_apply_mla_rope_for_q(
                         q,
                         rotary_pos_cos,
                         rotary_pos_sin,
                         self.config.qk_head_dim,
                         self.config.qk_pos_emb_head_dim,
-                        cu_seqlens_q,
-                        cp_rank,
-                        cp_size,
                     )
-                key, value = fused_apply_mla_rope_for_kv(
-                    kv,
-                    k_pos_emb,
+                )
+            key, value = _FusedKVRoPEQuantForFusedAttn.apply(
+                kv,
+                k_pos_emb,
+                rotary_pos_cos,
+                rotary_pos_sin,
+                self.config.qk_pos_emb_head_dim,
+                self.config.qk_head_dim,
+                self.config.v_head_dim,
+            )
+            mxfp8_transpose_swizzle([quantized_query, key, value], "sbhd")
+            return quantized_query, key, value
+
+        # todo add assert about fusions and caching
+        if self.config.apply_rope_fusion:
+            cp_rank = runtime_cp_group.rank()
+            cp_size = runtime_cp_group.size()
+            if not use_fused_q_uproj:
+                query = fused_apply_mla_rope_for_q(
+                    q,
                     rotary_pos_cos,
                     rotary_pos_sin,
-                    self.config.qk_pos_emb_head_dim,
                     self.config.qk_head_dim,
-                    self.config.v_head_dim,
-                    cu_seqlens_kv,
+                    self.config.qk_pos_emb_head_dim,
+                    cu_seqlens_q,
                     cp_rank,
                     cp_size,
                 )
-                if use_fused_q_uproj:
-                    # Quantize K/V to MXFP8, then transpose+swizzle scales for all three
-                    key, value = _QuantizeKVForFusedAttn.apply(key, value)
-                    mxfp8_transpose_swizzle([query, key, value], "sbhd")
-            else:
-                q_len = q.size()[0]
-                if inference_context is not None:
-                    # add offset to the sequence start for inference
-                    sequence_start = inference_context.sequence_len_offset
-                    sequence_end = sequence_start + q_len
-                    rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
-                elif packed_seq_params is None or runtime_cp_group.size() == 1:
-                    # Shorten rotary_pos_emb to the sequence length when inference_params
-                    # is not provided. This makes sure we can run forward directly with
-                    # any sequence length. During training, the sequence length is always
-                    # the full rotary_pos_emb length, except for sequence packing + CP.
-                    # When sequence packing and context parallel are both enabled, the
-                    # position embedding will not split rotary_pos_emb, so it may exceed
-                    # the sequence length on this CP rank, but we need the full rotary_pos_emb
-                    # to cover the full sequence, so we do not shorten it here.
-                    rotary_pos_emb = rotary_pos_emb[0:q_len]
-
-                # q_no_pe: [num_tokens, n, qk_head_dim]
-                # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
-                q_no_pe, q_pos_emb = torch.split(
-                    q, [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim], dim=-1
-                )
-
-                # k_no_pe: [num_tokens, n, qk_head_dim]
-                # value: [num_tokens, n, v_head_dim]
-                k_no_pe, value = torch.split(
-                    kv, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1
-                )
-
-                # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
-                q_pos_emb = apply_rotary_pos_emb(
-                    q_pos_emb,
-                    rotary_pos_emb,
-                    config=self.config,
-                    cu_seqlens=cu_seqlens_q,
-                    mscale=mscale,
-                    cp_group=runtime_cp_group,
-                    mla_rotary_interleaved=True,
-                    max_seqlen=rope_freqs_max_seqlen,
-                )
-                # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
-                k_pos_emb = apply_rotary_pos_emb(
-                    k_pos_emb,
-                    rotary_pos_emb,
-                    config=self.config,
-                    cu_seqlens=cu_seqlens_kv,
-                    mscale=mscale,
-                    cp_group=runtime_cp_group,
-                    mla_rotary_interleaved=True,
-                    max_seqlen=rope_freqs_max_seqlen,
-                )
-
-                # query: [num_tokens, n, (qk_head_dim + v_head_dim)]
-                query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
-
-                # key: [num_tokens, n, (qk_head_dim + v_head_dim)]
-                if k_pos_emb.ndim == 4:
-                    k_pos_emb = k_pos_emb.expand(-1, -1, self.num_attention_heads_per_partition, -1)
-                else:
-                    assert k_pos_emb.ndim == 3
-                    k_pos_emb = k_pos_emb.expand(-1, self.num_attention_heads_per_partition, -1)
-                key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
-
-            if not use_fused_q_uproj:
-                query = query.contiguous()
-                key = key.contiguous()
-                value = value.contiguous()
-
-            return query, key, value
-
-        if self.recompute_up_proj:
-            quantization = self.config.fp8 or self.config.fp4
-            self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=quantization)
-            query, key, value = self.qkv_up_checkpoint.checkpoint(
-                qkv_up_proj_and_rope_apply, q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
+            key, value = fused_apply_mla_rope_for_kv(
+                kv,
+                k_pos_emb,
+                rotary_pos_cos,
+                rotary_pos_sin,
+                self.config.qk_pos_emb_head_dim,
+                self.config.qk_head_dim,
+                self.config.v_head_dim,
+                cu_seqlens_kv,
+                cp_rank,
+                cp_size,
             )
+            if use_fused_q_uproj:
+                # Quantize K/V to MXFP8, then transpose+swizzle scales for all three
+                key, value = _QuantizeKVForFusedAttn.apply(key, value)
+                mxfp8_transpose_swizzle([query, key, value], "sbhd")
         else:
-            if self.cache_mla_latents:
-                assert (
-                    inference_context and not inference_context.is_static_batching()
-                ), "Caching MLA latents only works with dynamic backend inference"
-                query, key, value = qkv_up_proj_and_rope_apply_for_cached_latent_kv(
-                    q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
-                )
-            else:
-                query, key, value = qkv_up_proj_and_rope_apply(
-                    q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
-                )
+            q_len = q.size()[0]
+            if inference_context is not None:
+                # add offset to the sequence start for inference
+                sequence_start = inference_context.sequence_len_offset
+                sequence_end = sequence_start + q_len
+                rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
+            elif packed_seq_params is None or runtime_cp_group.size() == 1:
+                # Shorten rotary_pos_emb to the sequence length when inference_params
+                # is not provided. This makes sure we can run forward directly with
+                # any sequence length. During training, the sequence length is always
+                # the full rotary_pos_emb length, except for sequence packing + CP.
+                # When sequence packing and context parallel are both enabled, the
+                # position embedding will not split rotary_pos_emb, so it may exceed
+                # the sequence length on this CP rank, but we need the full rotary_pos_emb
+                # to cover the full sequence, so we do not shorten it here.
+                rotary_pos_emb = rotary_pos_emb[0:q_len]
 
-        return query, key, value, q_compressed, kv_compressed
+            # q_no_pe: [num_tokens, n, qk_head_dim]
+            # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
+            q_no_pe, q_pos_emb = torch.split(
+                q, [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim], dim=-1
+            )
+
+            # k_no_pe: [num_tokens, n, qk_head_dim]
+            # value: [num_tokens, n, v_head_dim]
+            k_no_pe, value = torch.split(
+                kv, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1
+            )
+
+            # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
+            q_pos_emb = apply_rotary_pos_emb(
+                q_pos_emb,
+                rotary_pos_emb,
+                config=self.config,
+                cu_seqlens=cu_seqlens_q,
+                mscale=mscale,
+                cp_group=runtime_cp_group,
+                mla_rotary_interleaved=True,
+                max_seqlen=rope_freqs_max_seqlen,
+            )
+            # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
+            k_pos_emb = apply_rotary_pos_emb(
+                k_pos_emb,
+                rotary_pos_emb,
+                config=self.config,
+                cu_seqlens=cu_seqlens_kv,
+                mscale=mscale,
+                cp_group=runtime_cp_group,
+                mla_rotary_interleaved=True,
+                max_seqlen=rope_freqs_max_seqlen,
+            )
+
+            # query: [num_tokens, n, (qk_head_dim + v_head_dim)]
+            query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
+
+            # key: [num_tokens, n, (qk_head_dim + v_head_dim)]
+            if k_pos_emb.ndim == 4:
+                k_pos_emb = k_pos_emb.expand(-1, -1, self.num_attention_heads_per_partition, -1)
+            else:
+                assert k_pos_emb.ndim == 3
+                k_pos_emb = k_pos_emb.expand(-1, self.num_attention_heads_per_partition, -1)
+            key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
+
+        if not use_fused_q_uproj:
+            query = query.contiguous()
+            key = key.contiguous()
+            value = value.contiguous()
+
+        return query, key, value
 
     def uncompress_kv_from_cache(self, kv_cached):
         """

@@ -5,6 +5,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from inspect import signature
 from typing import Any, Dict, Optional, Tuple, Union
@@ -19,6 +20,7 @@ except ImportError:
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
+from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.te_cuda_graphs import TECudaGraphMixin
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
@@ -30,7 +32,6 @@ from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphS
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.residual_connection import ResidualBranchInput
-from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
@@ -185,27 +186,18 @@ class MambaLayer(TECudaGraphMambaLayerMixin, GraphableMegatronModule, TwoStageAt
                 mixer_out_with_bias, residual, self.hidden_dropout
             )
 
-    def _prepare_mixer_state(
-        self,
-        hidden_states: Tensor,
-        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
-    ) -> tuple[ResidualBranchInput, ResidualStreamRecomputeContext | None]:
+    def _prepare_mixer_state(self, hidden_states: Tensor) -> ResidualBranchInput:
         """Prepare the ordinary branch and its saved residual for the shared schedule.
 
-        Subclasses choose their own local state and replay policy. Ordinary Mamba
-        does not register residual-stream checkpoints, even when a context is supplied.
+        Subclasses choose their own local state. Residual-stream replay of a connected layer is
+        applied to its residual connection and norm by the layer stack's residual replay.
         """
 
         residual = self._prepare_residual(hidden_states)
         hidden_states = self._prepare_mixer_input(hidden_states)
-        return ResidualBranchInput(hidden_states, residual), None
+        return ResidualBranchInput(hidden_states, residual)
 
-    def _apply_mixer_update(
-        self,
-        mixer_out_with_bias,
-        state: Any,
-        recompute_context: ResidualStreamRecomputeContext | None = None,
-    ) -> Tensor:
+    def _apply_mixer_update(self, mixer_out_with_bias, state: Any) -> Tensor:
         """Complete the ordinary mixer update using its saved residual."""
 
         return self._apply_mixer_bda(mixer_out_with_bias, state)
@@ -227,7 +219,6 @@ class MambaLayer(TECudaGraphMambaLayerMixin, GraphableMegatronModule, TwoStageAt
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         packed_sequence_cp_metadata: PackedSequenceCPMetadata | None = None,
-        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
     ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, tuple[Tensor, ...]]:
         """Run normalization, input projection, and the selective SSM/SSD.
 
@@ -246,10 +237,7 @@ class MambaLayer(TECudaGraphMambaLayerMixin, GraphableMegatronModule, TwoStageAt
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
         assert inference_context is None, "Two-stage mixer execution does not support inference."
-
-        prepared, _ = self._prepare_mixer_state(
-            hidden_states, residual_stream_recompute_context=residual_stream_recompute_context
-        )
+        prepared = self._prepare_mixer_state(hidden_states)
 
         ssm_output = self.mixer.forward_pre_attn_and_core_attn(
             prepared.branch_input,
@@ -285,11 +273,13 @@ class MambaLayer(TECudaGraphMambaLayerMixin, GraphableMegatronModule, TwoStageAt
         attention_mask: Optional[Tensor] = None,  # Not used in MambaLayer
         inference_context: Optional[BaseInferenceContext] = None,
         rotary_pos_emb: Optional[Tensor] = None,  # Not used in MambaLayer
-        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         packed_sequence_cp_metadata: PackedSequenceCPMetadata | None = None,
+        sequence_len_offset: Optional[Tensor] = None,  # Not used in MambaLayer
+        padding_mask: Optional[Tensor] = None,  # Not used in MambaLayer
+        input_ids: Optional[Tensor] = None,  # Not used in MambaLayer
     ):
         """
         Perform a forward pass through the Mamba layer.
@@ -306,8 +296,8 @@ class MambaLayer(TECudaGraphMambaLayerMixin, GraphableMegatronModule, TwoStageAt
             rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
             packed_sequence_cp_metadata (PackedSequenceCPMetadata, optional): Rank-local
                 packed-sequence metadata for chunkwise CP.
-            residual_stream_recompute_context (ResidualStreamRecomputeContext, optional):
-                Call-local ordered replay state for a configured residual connection.
+            sequence_len_offset, padding_mask, input_ids: Accepted for the layer stack's uniform
+                layer call; not used by this layer.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
@@ -319,12 +309,11 @@ class MambaLayer(TECudaGraphMambaLayerMixin, GraphableMegatronModule, TwoStageAt
         # model's Mamba layers aren't a blind spot in the per-layer breakdown (they were
         # ~34s of uninstrumented first-iteration warmup). No-op unless the 'layer' span
         # group is enabled, so zero cost on normal runs.
+        del sequence_len_offset, padding_mask, input_ids
         with _otel_managed_span(
             'layer', 'megatron.layer.forward', **{'megatron.layer_number': self.layer_number}
         ):
-            prepared, recompute_context = self._prepare_mixer_state(
-                hidden_states, residual_stream_recompute_context=residual_stream_recompute_context
-            )
+            prepared = self._prepare_mixer_state(hidden_states)
 
             # Mamba mixer: conv + selective SSM/SSD -- the compute block, analog of the
             # transformer layer's self_attention/mlp (this is where the SSD kernel autotune
@@ -344,11 +333,23 @@ class MambaLayer(TECudaGraphMambaLayerMixin, GraphableMegatronModule, TwoStageAt
                         packed_sequence_cp_metadata=packed_sequence_cp_metadata,
                     )
 
-            hidden_states = self._apply_mixer_update(
-                mixer_out_with_bias, prepared.state, recompute_context=recompute_context
-            )
+            hidden_states = self._apply_mixer_update(mixer_out_with_bias, prepared.state)
 
             return hidden_states
+
+    def get_inner_quantization_context(self) -> AbstractContextManager:
+        """This layer's FP8/FP4 context under a per-layer recipe, entered around each call (none
+        under delayed scaling, whose context the layer stack enters once)."""
+        config = self.config
+        if config.fp8 and config.fp8_recipe != Fp8Recipe.delayed:
+            from megatron.core.fp8_utils import get_fp8_context  # to avoid circular import
+
+            return get_fp8_context(config, self.layer_number - 1)
+        if config.fp4:
+            from megatron.core.fp4_utils import get_fp4_context  # to avoid circular import
+
+            return get_fp4_context(config, self.layer_number - 1)
+        return nullcontext()
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None

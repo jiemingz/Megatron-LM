@@ -8,6 +8,10 @@ import types
 import pytest
 import torch
 
+from megatron.core.activation_policy import CheckpointStrategy, has_strategy
+from megatron.core.activation_policy.recompute.checkpointing import (
+    checkpoint as tensor_parallel_checkpoint,
+)
 from megatron.core.context_parallel import ContextParallelBatch, get_batches_on_this_cp_rank
 from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import HAVE_TE, _resolve_is_first_microbatch
@@ -35,7 +39,6 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
-from megatron.core.tensor_parallel.random import checkpoint as tensor_parallel_checkpoint
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import multi_token_prediction as mtp_module
 from megatron.core.transformer.hyper_connection import learned_output_contract
@@ -113,7 +116,6 @@ def _randint_stub(expected_size, make_result):
 def test_checkpointed_forward_uses_layer_tp_group_not_global(precision, monkeypatch):
     """MTP full recompute must use the layer's TP group, never the global MPU one: a model
     built from an explicit ProcessGroupCollection may never initialize global MPU."""
-    import megatron.core.transformer.utils as transformer_utils
 
     def _uninitialized_global_tp_group(*args, **kwargs):
         raise AssertionError("tensor model parallel group is not initialized")
@@ -134,7 +136,8 @@ def test_checkpointed_forward_uses_layer_tp_group_not_global(precision, monkeypa
         return function(*args, **kwargs)
 
     monkeypatch.setattr(
-        transformer_utils.tensor_parallel, "checkpoint", fake_tensor_parallel_checkpoint
+        "megatron.core.activation_policy.recompute.checkpointing.checkpoint",
+        fake_tensor_parallel_checkpoint,
     )
     monkeypatch.setattr(
         "megatron.core.extensions.transformer_engine.te_checkpoint", fake_te_checkpoint
@@ -147,6 +150,7 @@ def test_checkpointed_forward_uses_layer_tp_group_not_global(precision, monkeypa
         fp8=None,
         fp4="nvfp4" if precision == "fp4" else None,
         fp8_recipe=None,
+        recompute_granularity="full",
         recompute_method="uniform",
         recompute_num_layers=1,
         distribute_saved_activations=False,
@@ -154,13 +158,30 @@ def test_checkpointed_forward_uses_layer_tp_group_not_global(precision, monkeypa
     object.__setattr__(layer, "config", config)
     object.__setattr__(layer, "tp_group", tp_group)
     object.__setattr__(layer, "is_hybrid_mtp", False)
+    object.__setattr__(layer, "training", True)
+
+    # Named like the real method: a method point is hooked under its function's name.
+    def _proj_and_transformer_layer(_self, **kwargs):
+        return kwargs["hidden_states"] + kwargs["decoder_input"]
+
     object.__setattr__(
-        layer,
-        "_proj_and_transformer_layer",
-        lambda **kwargs: kwargs["hidden_states"] + kwargs["decoder_input"],
+        layer, "_proj_and_transformer_layer", types.MethodType(_proj_and_transformer_layer, layer)
+    )
+    # Built without __init__: install the strategy MultiTokenPredictionLayer would.
+    layer.install_activation_strategies(
+        [
+            CheckpointStrategy(
+                layer._proj_and_transformer_layer,
+                training_only=True,
+                distribute_saved_activations=False,
+                delayed_fp8_context=True,
+            )
+        ]
     )
 
-    output = layer._checkpointed_forward(torch.ones(2, 1, 4), torch.full((2, 1, 4), 2.0))
+    output = layer._proj_and_transformer_layer(
+        hidden_states=torch.ones(2, 1, 4), decoder_input=torch.full((2, 1, 4), 2.0)
+    )
 
     assert torch.equal(output, torch.full((2, 1, 4), 3.0))
     expected = ("te", tp_group) if precision == "fp4" else ("tensor_parallel", None)
@@ -4315,13 +4336,10 @@ class TestMultiTokenPredictionHybrid:
             assert kwargs["hidden_states"] is hidden_states
             return hidden_states + 1
 
-        def outer_forward(_self, **_kwargs):
-            calls["outer"] += 1
-            raise AssertionError("Hybrid MTP must not use the outer checkpoint")
-
         layer._get_embeddings = types.MethodType(get_embeddings, layer)
         layer._proj_and_transformer_layer = types.MethodType(inner_forward, layer)
-        layer._checkpointed_forward = types.MethodType(outer_forward, layer)
+        # Hybrid MTP must not checkpoint its projection + layer region as a whole.
+        assert not has_strategy(layer, layer._proj_and_transformer_layer, CheckpointStrategy)
 
         output, *_ = layer(
             input_ids=input_ids,
@@ -4332,7 +4350,7 @@ class TestMultiTokenPredictionHybrid:
             embedding=object(),
         )
 
-        assert calls == {"inner": 1, "outer": 0}
+        assert calls["inner"] == 1
         torch.testing.assert_close(output, hidden_states + 1)
 
     @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")

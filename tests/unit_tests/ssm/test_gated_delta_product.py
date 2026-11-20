@@ -16,6 +16,7 @@ bitwise bar as everything else.
 import pytest
 import torch
 
+from megatron.core.activation_policy import CheckpointWithoutOutputStrategy, has_strategy
 from megatron.core.ssm.gated_delta_product import HAVE_FLA
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -92,8 +93,16 @@ def test_in_proj_recompute_parity(recompute_qkv):
         modules = ["gdp_in_proj"] + (["gdp_qkv"] if recompute_qkv else [])
         baseline = _build_mixer(_make_config([]))
         recomputed = _build_mixer(_make_config(modules), state_dict=baseline.state_dict())
-        assert recomputed.recompute_in_proj and not baseline.recompute_in_proj
-        assert recomputed.recompute_qkv == recompute_qkv
+        assert has_strategy(
+            recomputed, recomputed._in_proj_preprocess, CheckpointWithoutOutputStrategy
+        )
+        assert not has_strategy(
+            baseline, baseline._in_proj_preprocess, CheckpointWithoutOutputStrategy
+        )
+        assert (
+            has_strategy(recomputed, recomputed._prepare_qkv, CheckpointWithoutOutputStrategy)
+            == recompute_qkv
+        )
 
         sequence_length, micro_batch_size = 256, 2
         hidden_states = torch.randn(
@@ -126,7 +135,12 @@ def test_fp8_in_proj_recompute_parity(fp8_recipe):
         recomputed = _build_mixer(
             _make_config(["gdp_in_proj"], fp8_recipe=fp8_recipe), state_dict=baseline.state_dict()
         )
-        assert recomputed.recompute_in_proj and not baseline.recompute_in_proj
+        assert has_strategy(
+            recomputed, recomputed._in_proj_preprocess, CheckpointWithoutOutputStrategy
+        )
+        assert not has_strategy(
+            baseline, baseline._in_proj_preprocess, CheckpointWithoutOutputStrategy
+        )
 
         # FP8 GEMMs need the token dimension aligned; keep it a multiple of 128.
         sequence_length, micro_batch_size = 256, 2

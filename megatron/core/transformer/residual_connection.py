@@ -9,8 +9,6 @@ from typing import Generic, Literal, NamedTuple, Optional, TypeAlias, TypeVar, o
 import torch
 from torch import Tensor, nn
 
-from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
-
 ResidualBranchOutput: TypeAlias = Tensor | tuple[Tensor, Optional[Tensor]]
 ResidualConnectionState: TypeAlias = tuple[Tensor, ...]
 ResidualConnectionOperation: TypeAlias = Literal["read", "write"]
@@ -42,15 +40,12 @@ class ResidualBranchInput(NamedTuple, Generic[_StateT]):
 class ResidualConnection(nn.Module, ABC):
     """Read one branch input from, then write its update to, a residual stream.
 
-    ``forward`` validates and dispatches both eager and checkpointed execution. The first state
-    tensor is the carried residual stream, which may be a selected autograd alias of the input.
-    Concrete connections own bias, dropout, mapping, and residual-update semantics.
+    ``forward`` validates the inputs, runs the operation (:meth:`_read` / :meth:`_write`) and
+    validates its result. The first state tensor is the carried residual stream, which may be a
+    selected autograd alias of the input. Concrete connections own bias, dropout, mapping, and
+    residual-update semantics.
 
     ``operation`` fixes an instance to one operation at construction.
-
-    Each operation enters this module once; replay skips its ``forward`` and hooks.
-    Eager and checkpointed computations must be equivalent. Hooks and forward overrides
-    must not mutate checkpoint-owned output storage: replay restores the original values.
     """
 
     def __init__(
@@ -91,7 +86,6 @@ class ResidualConnection(nn.Module, ABC):
         fp32_residual_connection: bool = False,
         branch_input_dtype: torch.dtype | None = None,
         execution_context: object | None = None,
-        recompute_context: ResidualStreamRecomputeContext | None = None,
     ) -> tuple[Tensor, ResidualConnectionState]: ...
 
     @overload
@@ -103,7 +97,6 @@ class ResidualConnection(nn.Module, ABC):
         dropout_probability: float,
         training: bool,
         execution_context: object | None = None,
-        recompute_context: ResidualStreamRecomputeContext | None = None,
     ) -> Tensor: ...
 
     def forward(
@@ -116,7 +109,6 @@ class ResidualConnection(nn.Module, ABC):
         dropout_probability: float | None = None,
         training: bool | None = None,
         execution_context: object | None = None,
-        recompute_context: ResidualStreamRecomputeContext | None = None,
     ) -> Tensor | tuple[Tensor, ResidualConnectionState]:
         """Execute one residual operation through the standard module call path.
 
@@ -126,8 +118,6 @@ class ResidualConnection(nn.Module, ABC):
         ``execution_context`` supplies modules and options for this call, such as mHC's mixing
         module and fusion flag. Module ownership and registration stay with the caller.
 
-        ``recompute_context=None`` selects eager execution. Otherwise, the connection uses
-        its checkpoint implementation, which chooses what to replay.
         """
 
         match self.operation:
@@ -137,21 +127,12 @@ class ResidualConnection(nn.Module, ABC):
                 if state is not None or dropout_probability is not None or training is not None:
                     raise TypeError("Residual connection read received write-only arguments.")
                 self._validate_read_input(value, branch_input_dtype)
-                if recompute_context is None:
-                    branch_input, connection_state = self._eager_read(
-                        value,
-                        fp32_residual_connection=fp32_residual_connection,
-                        branch_input_dtype=branch_input_dtype,
-                        execution_context=execution_context,
-                    )
-                else:
-                    branch_input, connection_state = self._checkpoint_read(
-                        value,
-                        recompute_context,
-                        fp32_residual_connection=fp32_residual_connection,
-                        branch_input_dtype=branch_input_dtype,
-                        execution_context=execution_context,
-                    )
+                branch_input, connection_state = self._read(
+                    value,
+                    fp32_residual_connection=fp32_residual_connection,
+                    branch_input_dtype=branch_input_dtype,
+                    execution_context=execution_context,
+                )
                 self._validate_read_output(
                     value, branch_input, connection_state, branch_input_dtype
                 )
@@ -166,23 +147,13 @@ class ResidualConnection(nn.Module, ABC):
                         "Residual connection write requires dropout_probability and training."
                     )
                 self._validate_write_input(value, state)
-                if recompute_context is None:
-                    hidden_states = self._eager_write(
-                        value,
-                        state,
-                        dropout_probability=dropout_probability,
-                        training=training,
-                        execution_context=execution_context,
-                    )
-                else:
-                    hidden_states = self._checkpoint_write(
-                        value,
-                        state,
-                        recompute_context,
-                        dropout_probability=dropout_probability,
-                        training=training,
-                        execution_context=execution_context,
-                    )
+                hidden_states = self._write(
+                    value,
+                    state,
+                    dropout_probability=dropout_probability,
+                    training=training,
+                    execution_context=execution_context,
+                )
                 self._validate_write_output(hidden_states, state)
                 return hidden_states
             case _:
@@ -191,7 +162,7 @@ class ResidualConnection(nn.Module, ABC):
     def _validate_read_input(
         self, hidden_states: Tensor, branch_input_dtype: torch.dtype | None
     ) -> None:
-        """Validate inputs shared by eager and checkpointed reads without changing tensors."""
+        """Validate a read's inputs without changing tensors."""
 
         if not torch.is_tensor(hidden_states):
             raise TypeError("Residual connection read expects a tensor.")
@@ -216,7 +187,7 @@ class ResidualConnection(nn.Module, ABC):
         state: ResidualConnectionState,
         branch_input_dtype: torch.dtype | None,
     ) -> None:
-        """Validate either read implementation while preserving its selected state."""
+        """Validate a read's result while preserving its selected state."""
 
         if not torch.is_tensor(branch_input):
             raise TypeError(
@@ -248,7 +219,7 @@ class ResidualConnection(nn.Module, ABC):
     def _validate_write_input(
         self, branch_output: ResidualBranchOutput, state: ResidualConnectionState
     ) -> None:
-        """Validate inputs shared by eager and checkpointed writes without changing tensors."""
+        """Validate a write's inputs without changing tensors."""
 
         self._validate_branch_output(branch_output)
         self._validate_state(state)
@@ -266,7 +237,7 @@ class ResidualConnection(nn.Module, ABC):
             )
 
     def _validate_write_output(self, hidden_states: Tensor, state: ResidualConnectionState) -> None:
-        """Validate either write implementation's output."""
+        """Validate a write's output."""
 
         if not torch.is_tensor(hidden_states):
             raise TypeError(
@@ -278,46 +249,6 @@ class ResidualConnection(nn.Module, ABC):
                 f"{type(self).__name__} changed the residual-stream shape while writing: "
                 f"{tuple(state[0].shape)} -> {tuple(hidden_states.shape)}."
             )
-
-    def _checkpoint_read(
-        self,
-        hidden_states: Tensor,
-        context: ResidualStreamRecomputeContext,
-        *,
-        fp32_residual_connection: bool,
-        branch_input_dtype: torch.dtype | None,
-        execution_context: object | None,
-    ) -> tuple[Tensor, ResidualConnectionState]:
-        """Require the algorithm to choose which read results can be discarded and replayed.
-
-        The carried residual may alias the input, and predicted maps may need to stay live.
-        Checkpointing or reconstructing the complete state here would make that choice
-        implicitly for every algorithm.
-        """
-
-        raise NotImplementedError(
-            f"{type(self).__name__} must implement _checkpoint_read to select its replay policy."
-        )
-
-    def _checkpoint_write(
-        self,
-        branch_output: ResidualBranchOutput,
-        state: ResidualConnectionState,
-        context: ResidualStreamRecomputeContext,
-        *,
-        dropout_probability: float,
-        training: bool,
-        execution_context: object | None,
-    ) -> Tensor:
-        """Require the algorithm to choose which write result can be discarded and replayed.
-
-        A write result may alias an input or require a smaller replay boundary. The concrete
-        connection must explicitly select whole-write replay when its output is safe to discard.
-        """
-
-        raise NotImplementedError(
-            f"{type(self).__name__} must implement _checkpoint_write to select its replay policy."
-        )
 
     @staticmethod
     def residual_stream(state: ResidualConnectionState) -> Tensor:
@@ -349,7 +280,7 @@ class ResidualConnection(nn.Module, ABC):
             )
 
     @abstractmethod
-    def _eager_read(
+    def _read(
         self,
         hidden_states: Tensor,
         *,
@@ -357,14 +288,14 @@ class ResidualConnection(nn.Module, ABC):
         branch_input_dtype: torch.dtype | None,
         execution_context: object | None,
     ) -> tuple[Tensor, ResidualConnectionState]:
-        """Read without registering replay, returning ``(branch, (residual, *algorithm_state))``.
+        """Read, returning ``(branch, (residual, *algorithm_state))``.
 
         The implementation selects the carried residual, any additional tensors, and their
         precision. The shared forward validates the result and passes the state unchanged.
         """
 
     @abstractmethod
-    def _eager_write(
+    def _write(
         self,
         branch_output: ResidualBranchOutput,
         state: ResidualConnectionState,
@@ -373,4 +304,4 @@ class ResidualConnection(nn.Module, ABC):
         training: bool,
         execution_context: object | None,
     ) -> Tensor:
-        """Apply the branch update without registering replay, using the complete read state."""
+        """Apply the branch update, using the complete read state."""
