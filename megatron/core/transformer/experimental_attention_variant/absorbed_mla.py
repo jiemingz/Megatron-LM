@@ -452,21 +452,28 @@ class AbsorbedMLASelfAttention(Attention):
         )
 
     def activation_strategies(self) -> list:
-        """Activation strategies (replacing Attention's; points: _qkv_up_proj_and_rope,
-        core_attention, linear_proj). Absorbed MLA supports no activation offloading."""
-        config = self.config
-        activation_strategies = []
-        if config.recompute_selected("core_attn"):
-            activation_strategies.append(
-                CheckpointStrategy(self.core_attention, impl="tensor_parallel", training_only=True)
-            )
-        if config.recompute_selected("mla_up_proj"):
+        """Attention's (core attention recompute only: absorbed MLA supports no activation
+        offloading), plus the Q/KV up-projection recompute (point: _qkv_up_proj_and_rope)."""
+        activation_strategies = super().activation_strategies()
+        if self.config.recompute_selected("mla_up_proj"):
             activation_strategies.append(
                 CheckpointWithoutOutputStrategy(
                     self._qkv_up_proj_and_rope, release_on=Event(self.linear_proj, "enter")
                 )
             )
         return activation_strategies
+
+    def _qkv_strategies(self) -> list:
+        return []
+
+    def _core_attention_strategies(self) -> list:
+        """Core attention recompute (point: the core_attention module)."""
+        if not self.config.recompute_selected("core_attn"):
+            return []
+        return [CheckpointStrategy(self.core_attention, impl="tensor_parallel", training_only=True)]
+
+    def _attn_proj_strategies(self) -> list:
+        return []
 
     def get_query_key_value_tensors(
         self,

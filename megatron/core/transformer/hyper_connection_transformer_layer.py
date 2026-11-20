@@ -7,14 +7,7 @@ from typing import Optional
 
 from torch import Tensor
 
-from megatron.core.activation_policy import (
-    CheckpointStrategy,
-    CheckpointWithoutOutputStrategy,
-    Event,
-    OffloadStrategy,
-    ReplayRegion,
-    ResidualBranch,
-)
+from megatron.core.activation_policy import ReplayRegion, ResidualBranch
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.hyper_connection import (
@@ -146,35 +139,9 @@ class HyperConnectionTransformerLayer(
         # mHC has always bypassed this legacy hook, which cannot carry residual state.
         self._legacy_forward_post_mlp = None
 
-    def activation_strategies(self) -> list:
-        """Replaces TransformerLayer's. Under mHC recompute the norms replay with their block (see
-        get_residual_branches); the mHC kernels consume the residual, so the norm offload groups
-        release nothing."""
-        config = self.config
-        activation_strategies = []
-        if config.recompute_selected("layernorm") and not is_identity(self.input_layernorm):
-            activation_strategies.append(
-                CheckpointWithoutOutputStrategy(
-                    self.input_layernorm, release_on=Event(self._self_attn_bda, "enter")
-                )
-            )
-        if config.recompute_selected("layernorm") and not is_identity(self.pre_mlp_layernorm):
-            activation_strategies.append(
-                CheckpointWithoutOutputStrategy(
-                    self.pre_mlp_layernorm, release_on=Event(self._mlp_bda, "enter")
-                )
-            )
-        if config.offload_selected("attn_norm") and not is_identity(self.input_layernorm):
-            activation_strategies.append(
-                OffloadStrategy(self.input_layernorm, "attn_norm", commit_on=self._self_attn_bda)
-            )
-        if config.offload_selected("mlp_norm") and not is_identity(self.pre_mlp_layernorm):
-            activation_strategies.append(
-                OffloadStrategy(self.pre_mlp_layernorm, "mlp_norm", commit_on=self._mlp_bda)
-            )
-        if config.recompute_selected("mlp") and not self.is_moe_layer:
-            activation_strategies.append(CheckpointStrategy(self.mlp))
-        return activation_strategies
+    def _connected_norms_replayed(self) -> bool:
+        """mHC recompute replays the norms with their block (see get_residual_branches)."""
+        return self.config.mhc_replay()
 
     def get_residual_branches(self) -> list[ResidualBranch]:
         """Each active half's mHC read (``aggregate``), its norm and H_post expansion, and its

@@ -17,7 +17,6 @@ except ImportError:
     HAVE_EINOPS = False
 
 from megatron.core.activation_policy import (
-    CheckpointStrategy,
     CheckpointWithoutOutputStrategy,
     Event,
     OffloadStrategy,
@@ -433,47 +432,10 @@ class MultiLatentAttention(Attention):
             set_save_original_input(self.linear_proj)
 
     def activation_strategies(self) -> list:
-        """Activation strategies (replacing Attention's; points: _qkv_linear_region (down
-        projections), _qkv_up_proj_and_rope (Q/KV up projections and RoPE, nested in
-        _qkv_linear_region), _run_core_attention, linear_proj)."""
-        config = self.config
-        activation_strategies = []
-        if config.offload_selected("qkv_linear"):
-            # Unlike Attention, releases the layer input. (Core attention may run on pre-quantized
-            # q/k/v; the runtime never releases quantized tensors.)
-            activation_strategies.append(
-                OffloadStrategy(
-                    self._qkv_linear_region,
-                    "qkv_linear",
-                    release=(TensorRef.input(self._qkv_linear_region),),
-                )
-            )
-        if config.recompute_selected("core_attn"):
-            activation_strategies.append(
-                CheckpointStrategy(
-                    self._run_core_attention, impl="tensor_parallel", training_only=True
-                )
-            )
-        elif config.offload_selected("core_attn"):
-            activation_strategies.append(
-                OffloadStrategy(
-                    self._run_core_attention,
-                    "core_attn",
-                    release=(
-                        TensorRef.input(self._run_core_attention, 0),
-                        TensorRef.input(self._run_core_attention, 1),
-                        TensorRef.input(self._run_core_attention, 2),
-                    ),
-                    training_only=True,
-                )
-            )
-        if config.offload_selected("attn_proj"):
-            activation_strategies.append(
-                OffloadStrategy(
-                    self.linear_proj, "attn_proj", release=(TensorRef.input(self.linear_proj),)
-                )
-            )
-        if config.recompute_selected("mla_up_proj"):
+        """Attention's, plus the Q/KV up-projection recompute (point: _qkv_up_proj_and_rope, the
+        up projections and RoPE nested in _qkv_linear_region)."""
+        activation_strategies = super().activation_strategies()
+        if self.config.recompute_selected("mla_up_proj"):
             # q/k/v are discarded once core attention consumed them and rebuilt from the gradient
             # of the core attention output (the attn_proj input).
             activation_strategies.append(
@@ -482,6 +444,23 @@ class MultiLatentAttention(Attention):
                 )
             )
         return activation_strategies
+
+    def _qkv_strategies(self) -> list:
+        """Offloading of the down projections (point: _qkv_linear_region). Unlike Attention, it
+        releases the layer input. (Core attention may run on pre-quantized q/k/v; the runtime
+        never releases quantized tensors.)"""
+        if not self.config.offload_selected("qkv_linear"):
+            return []
+        return [
+            OffloadStrategy(
+                self._qkv_linear_region,
+                "qkv_linear",
+                release=(TensorRef.input(self._qkv_linear_region),),
+            )
+        ]
+
+    def _core_attention_offload_validation(self):
+        return None
 
     def _run_core_attention(
         self,

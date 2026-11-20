@@ -253,30 +253,11 @@ class DSv4HybridAttention(Attention):
         ), "Offload qkv linear is not supported in DSv4 Hybrid Attention."
 
     def activation_strategies(self) -> list:
-        """Replaces Attention's; points: _qkv_up_proj_and_rope, _run_dsv4_core_attention with
-        inputs ``query, key, value, boundary_kv, ...``, _output_rope_and_group_proj (inverse output
-        RoPE and grouped output projection), linear_proj."""
-        config = self.config
-        activation_strategies = []
-        if config.offload_selected("core_attn"):
-            # Also releases the CP boundary K/V (input 3) when there is one.
-            activation_strategies.append(
-                OffloadStrategy(
-                    self._run_dsv4_core_attention,
-                    "core_attn",
-                    release=tuple(
-                        TensorRef.input(self._run_dsv4_core_attention, i) for i in range(4)
-                    ),
-                    training_only=True,
-                )
-            )
-        if config.offload_selected("attn_proj"):
-            activation_strategies.append(
-                OffloadStrategy(
-                    self.linear_proj, "attn_proj", release=(TensorRef.input(self.linear_proj),)
-                )
-            )
-        if config.recompute_selected("mla_up_proj"):
+        """Attention's (core attention offloading and output projection offloading; the config
+        rejects core attention recompute and QKV offloading here), plus the Q/KV up-projection
+        recompute (point: _qkv_up_proj_and_rope)."""
+        activation_strategies = super().activation_strategies()
+        if self.config.recompute_selected("mla_up_proj"):
             # Rebuilt from the gradient of the core attention output, which enters
             # _output_rope_and_group_proj.
             activation_strategies.append(
@@ -286,6 +267,23 @@ class DSv4HybridAttention(Attention):
                 )
             )
         return activation_strategies
+
+    def _qkv_strategies(self) -> list:
+        return []
+
+    def _core_attention_strategies(self) -> list:
+        """Core attention offloading (point: _run_dsv4_core_attention, inputs ``query, key, value,
+        boundary_kv, ...``); also releases the CP boundary K/V (input 3) when there is one."""
+        if not self.config.offload_selected("core_attn"):
+            return []
+        return [
+            OffloadStrategy(
+                self._run_dsv4_core_attention,
+                "core_attn",
+                release=tuple(TensorRef.input(self._run_dsv4_core_attention, i) for i in range(4)),
+                training_only=True,
+            )
+        ]
 
     def forward(
         self,

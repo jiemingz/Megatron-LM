@@ -457,23 +457,34 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             set_save_original_input(self.linear_proj)
 
     def activation_strategies(self) -> list:
-        """Activation strategies (points: get_query_key_value_tensors, _run_core_attention,
-        linear_proj)."""
+        """The QKV projection, core attention and output projection strategies (subclasses
+        override the parts that differ, see :meth:`_qkv_strategies`,
+        :meth:`_core_attention_strategies` and :meth:`_attn_proj_strategies`)."""
+        return (
+            self._qkv_strategies()
+            + self._core_attention_strategies()
+            + self._attn_proj_strategies()
+        )
+
+    def _qkv_strategies(self) -> list:
+        """Offloading of the QKV projection (point: get_query_key_value_tensors)."""
+        if not self.config.offload_selected("qkv_linear"):
+            return []
+        # Releases nothing: the layer input is the residual.
+        return [OffloadStrategy(self.get_query_key_value_tensors, "qkv_linear")]
+
+    def _core_attention_strategies(self) -> list:
+        """Recompute or offloading of core attention (point: _run_core_attention, whose inputs
+        0-2 are q, k and v)."""
         config = self.config
-        activation_strategies = []
-        if config.offload_selected("qkv_linear"):
-            # Releases nothing: the layer input is the residual.
-            activation_strategies.append(
-                OffloadStrategy(self.get_query_key_value_tensors, "qkv_linear")
-            )
         if config.recompute_selected("core_attn"):
-            activation_strategies.append(
+            return [
                 CheckpointStrategy(
                     self._run_core_attention, impl="tensor_parallel", training_only=True
                 )
-            )
-        elif config.offload_selected("core_attn"):
-            activation_strategies.append(
+            ]
+        if config.offload_selected("core_attn"):
+            return [
                 OffloadStrategy(
                     self._run_core_attention,
                     "core_attn",
@@ -483,16 +494,24 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         TensorRef.input(self._run_core_attention, 2),
                     ),
                     training_only=True,
-                    validate=_reject_packed_qkv_views(config),
+                    validate=self._core_attention_offload_validation(),
                 )
+            ]
+        return []
+
+    def _core_attention_offload_validation(self):
+        """Check of the core-attention inputs before their offload group releases them."""
+        return _reject_packed_qkv_views(self.config)
+
+    def _attn_proj_strategies(self) -> list:
+        """Offloading of the output projection's input (point: linear_proj)."""
+        if not self.config.offload_selected("attn_proj"):
+            return []
+        return [
+            OffloadStrategy(
+                self.linear_proj, "attn_proj", release=(TensorRef.input(self.linear_proj),)
             )
-        if config.offload_selected("attn_proj"):
-            activation_strategies.append(
-                OffloadStrategy(
-                    self.linear_proj, "attn_proj", release=(TensorRef.input(self.linear_proj),)
-                )
-            )
-        return activation_strategies
+        ]
 
     def _get_core_attention_extra_kwargs(
         self,

@@ -23,6 +23,7 @@ from megatron.core.activation_policy import (
     CheckpointStrategy,
     CheckpointWithoutOutputStrategy,
     Event,
+    ExcludeFromOffloadStrategy,
     OffloadStrategy,
     TensorRef,
 )
@@ -565,48 +566,64 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
 
     def activation_strategies(self) -> list:
         """The norms and the MLP are child-module points; the residual adds are the method points
-        _self_attn_bda and _mlp_bda. mHC and wide-residual layers override this."""
+        _self_attn_bda and _mlp_bda.
+
+        A half with a residual connection (wide residual, mHC) owns its carried residual: its norm
+        offload group releases nothing, and when the layer stack replays the connected norms with
+        their residual block (:meth:`_connected_norms_replayed`), the norm is not offloaded and
+        its output is kept out of other offload groups.
+        """
         config = self.config
+        replayed = self._connected_norms_replayed()
         activation_strategies = []
-        if config.recompute_selected("layernorm") and not is_identity(self.input_layernorm):
-            # The norm output is released when the attention output reaches the residual add.
-            activation_strategies.append(
-                CheckpointWithoutOutputStrategy(
-                    self.input_layernorm,
-                    release_on=Event(self._self_attn_bda, "enter"),
-                    retain_input_tensors=self._input_layernorm_returns_residual,
+        for norm, bda, returns_residual, connection, offload_name in (
+            (
+                self.input_layernorm,
+                self._self_attn_bda,
+                self._input_layernorm_returns_residual,
+                self._get_residual_connection_for_self_attention(operation="read"),
+                "attn_norm",
+            ),
+            (
+                self.pre_mlp_layernorm,
+                self._mlp_bda,
+                self._pre_mlp_layernorm_returns_residual,
+                self._get_residual_connection_for_mlp(operation="read"),
+                "mlp_norm",
+            ),
+        ):
+            if is_identity(norm):
+                continue
+            connected = connection is not None
+            if config.recompute_selected("layernorm"):
+                # The norm output is released when the branch output reaches the residual add.
+                activation_strategies.append(
+                    CheckpointWithoutOutputStrategy(
+                        norm, release_on=Event(bda, "enter"), retain_input_tensors=returns_residual
+                    )
                 )
-            )
-        if config.recompute_selected("layernorm") and not is_identity(self.pre_mlp_layernorm):
-            activation_strategies.append(
-                CheckpointWithoutOutputStrategy(
-                    self.pre_mlp_layernorm,
-                    release_on=Event(self._mlp_bda, "enter"),
-                    retain_input_tensors=self._pre_mlp_layernorm_returns_residual,
+            if connected and replayed and config.fine_grained_activation_offloading:
+                activation_strategies.append(ExcludeFromOffloadStrategy(norm))
+            if config.offload_selected(offload_name):
+                # Commits after the residual add, which consumed the residual (its input 1),
+                # unless a residual connection owns the residual.
+                activation_strategies.append(
+                    OffloadStrategy(
+                        norm,
+                        offload_name,
+                        commit_on=bda,
+                        release=() if connected else (TensorRef.input(bda, 1),),
+                        skip_when_replayed=connected,
+                    )
                 )
-            )
-        if config.offload_selected("attn_norm") and not is_identity(self.input_layernorm):
-            # Commits after the residual add, which consumed the residual (its input 1).
-            activation_strategies.append(
-                OffloadStrategy(
-                    self.input_layernorm,
-                    "attn_norm",
-                    commit_on=self._self_attn_bda,
-                    release=(TensorRef.input(self._self_attn_bda, 1),),
-                )
-            )
-        if config.offload_selected("mlp_norm") and not is_identity(self.pre_mlp_layernorm):
-            activation_strategies.append(
-                OffloadStrategy(
-                    self.pre_mlp_layernorm,
-                    "mlp_norm",
-                    commit_on=self._mlp_bda,
-                    release=(TensorRef.input(self._mlp_bda, 1),),
-                )
-            )
         if config.recompute_selected("mlp") and not self.is_moe_layer:
             activation_strategies.append(CheckpointStrategy(self.mlp))
         return activation_strategies
+
+    def _connected_norms_replayed(self) -> bool:
+        """Whether the layer stack replays the norms of connected halves with their residual
+        block (see ``get_residual_branches``). No residual connections by default."""
+        return False
 
     def init_backward_dw_wrapper(self):
         """Initialize ``self.backward_dw_wrapper`` for delayed-wgrad scheduling.

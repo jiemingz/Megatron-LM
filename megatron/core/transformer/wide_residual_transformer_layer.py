@@ -5,16 +5,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from megatron.core.activation_policy import (
-    CheckpointStrategy,
-    CheckpointWithoutOutputStrategy,
-    Event,
-    ExcludeFromOffloadStrategy,
-    OffloadStrategy,
-    ReplayRegion,
-    ResidualBranch,
-    TensorRef,
-)
+from megatron.core.activation_policy import ReplayRegion, ResidualBranch
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.identity_op import is_identity
@@ -128,59 +119,9 @@ class WideResidualTransformerLayer(TransformerLayer):
                     f"{connection.branch_hidden_size}."
                 )
 
-    def activation_strategies(self) -> list:
-        """Replaces TransformerLayer's. A norm whose half has a residual connection is replayed
-        with its residual-stream block (see get_residual_branches); it is then not offloaded and
-        its output is kept out of other offload groups. Its offload group releases nothing, since
-        the connection consumes the residual."""
-        config = self.config
-        stream_replay = config.residual_stream_replay()
-        attn_connected = self.residual_read_self_attn is not None
-        mlp_connected = self.residual_read_mlp is not None
-        activation_strategies = []
-        if config.recompute_selected("layernorm") and not is_identity(self.input_layernorm):
-            activation_strategies.append(
-                CheckpointWithoutOutputStrategy(
-                    self.input_layernorm,
-                    release_on=Event(self._self_attn_bda, "enter"),
-                    retain_input_tensors=self._input_layernorm_returns_residual,
-                )
-            )
-        if config.recompute_selected("layernorm") and not is_identity(self.pre_mlp_layernorm):
-            activation_strategies.append(
-                CheckpointWithoutOutputStrategy(
-                    self.pre_mlp_layernorm,
-                    release_on=Event(self._mlp_bda, "enter"),
-                    retain_input_tensors=self._pre_mlp_layernorm_returns_residual,
-                )
-            )
-        if attn_connected and stream_replay and config.fine_grained_activation_offloading:
-            activation_strategies.append(ExcludeFromOffloadStrategy(self.input_layernorm))
-        if mlp_connected and stream_replay and config.fine_grained_activation_offloading:
-            activation_strategies.append(ExcludeFromOffloadStrategy(self.pre_mlp_layernorm))
-        if config.offload_selected("attn_norm") and not is_identity(self.input_layernorm):
-            activation_strategies.append(
-                OffloadStrategy(
-                    self.input_layernorm,
-                    "attn_norm",
-                    commit_on=self._self_attn_bda,
-                    release=() if attn_connected else (TensorRef.input(self._self_attn_bda, 1),),
-                    skip_when_replayed=attn_connected,
-                )
-            )
-        if config.offload_selected("mlp_norm") and not is_identity(self.pre_mlp_layernorm):
-            activation_strategies.append(
-                OffloadStrategy(
-                    self.pre_mlp_layernorm,
-                    "mlp_norm",
-                    commit_on=self._mlp_bda,
-                    release=() if mlp_connected else (TensorRef.input(self._mlp_bda, 1),),
-                    skip_when_replayed=mlp_connected,
-                )
-            )
-        if config.recompute_selected("mlp") and not self.is_moe_layer:
-            activation_strategies.append(CheckpointStrategy(self.mlp))
-        return activation_strategies
+    def _connected_norms_replayed(self) -> bool:
+        """Residual-stream recompute replays the connected norms (see get_residual_branches)."""
+        return self.config.residual_stream_replay()
 
     def get_residual_branches(self) -> list[ResidualBranch]:
         """The connected halves' residual read, norm and write (see ``ResidualReplayStrategy``)."""
