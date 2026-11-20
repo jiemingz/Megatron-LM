@@ -21,6 +21,10 @@ import torch.nn.functional as F
 import megatron.core.extensions.transformer_engine as te_ext
 from megatron.core import parallel_state
 from megatron.core.activation_policy import CheckpointStrategy, has_strategy
+from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface,
+    PipelineOffloadManager,
+)
 from megatron.core.activations import squared_relu
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.utils import InferenceMode
@@ -29,10 +33,6 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    FineGrainedActivationOffloadingInterface,
-    PipelineOffloadManager,
-)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed

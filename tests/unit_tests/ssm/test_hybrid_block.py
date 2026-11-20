@@ -8,7 +8,9 @@ import transformer_engine as te
 
 import megatron.core.models.hybrid.hybrid_block as hybrid_block_module
 import megatron.core.transformer.utils as transformer_utils
-from megatron.core.activation_policy.recompute.replay import build_recompute_block_end_plan
+from megatron.core.activation_policy.recompute.residual_recompute import (
+    build_recompute_block_end_plan,
+)
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers

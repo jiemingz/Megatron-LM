@@ -14,6 +14,7 @@ import sys
 import typing
 
 prefix = "megatron.core.transformer."
+modules = {"residual_recompute": "megatron.core.activation_policy.recompute.residual_recompute"}
 first = {
     "common-first": ("transformer_layer",),
     "canonical-first": (
@@ -26,14 +27,14 @@ first = {
     "recompute-first": ("residual_recompute", "residual_connection"),
 }[sys.argv[1]]
 for name in first:
-    importlib.import_module(prefix + name)
+    importlib.import_module(modules.get(name, prefix + name))
 
 connection = importlib.import_module(prefix + "residual_connection")
-recompute = importlib.import_module(prefix + "residual_recompute")
+recompute = importlib.import_module(modules["residual_recompute"])
 for method in (connection.ResidualConnection._read, connection.ResidualConnection._write):
     # The annotations resolve in every import order (no replay context is passed any more).
     assert "context" not in typing.get_type_hints(method)
-assert recompute.ResidualReplayStrategy.__module__.endswith("recompute.replay")
+assert recompute.ResidualReplayStrategy.__module__.endswith("recompute.residual_recompute")
 
 package = importlib.import_module("megatron.core.transformer")
 for symbol, new_name in (

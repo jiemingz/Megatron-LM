@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from megatron.core.activation_policy import install_activation_strategies, installed_strategies
+from megatron.core.activation_policy.recompute.checkpointing import CheckpointWithoutOutputManager
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
@@ -14,10 +15,7 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.pipeline_parallel.schedules import custom_backward, deallocate_output_tensor
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.random import (
-    CheckpointWithoutOutputManager,
-    model_parallel_cuda_manual_seed,
-)
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import (
     MegatronModule,

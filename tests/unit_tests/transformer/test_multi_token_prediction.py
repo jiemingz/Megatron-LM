@@ -9,6 +9,9 @@ import pytest
 import torch
 
 from megatron.core.activation_policy import CheckpointStrategy, has_strategy
+from megatron.core.activation_policy.recompute.checkpointing import (
+    checkpoint as tensor_parallel_checkpoint,
+)
 from megatron.core.context_parallel import ContextParallelBatch, get_batches_on_this_cp_rank
 from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import HAVE_TE, _resolve_is_first_microbatch
@@ -36,7 +39,6 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
-from megatron.core.tensor_parallel.random import checkpoint as tensor_parallel_checkpoint
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import multi_token_prediction as mtp_module
 from megatron.core.transformer.hyper_connection import learned_output_contract

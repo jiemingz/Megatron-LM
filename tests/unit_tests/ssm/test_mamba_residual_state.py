@@ -10,7 +10,7 @@ from torch import nn
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from megatron.core.activation_policy import install_activation_strategies
-from megatron.core.activation_policy.recompute import replay as replay_module
+from megatron.core.activation_policy.recompute import residual_recompute as replay_module
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.ssm.wide_residual_mamba_layer import WideResidualMambaLayer

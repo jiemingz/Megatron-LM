@@ -28,7 +28,7 @@ if not HAVE_GTP:
     pytest.skip("GTP requires TransformerEngine >= 2.19", allow_module_level=True)
 
 import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp_module
-from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
+from megatron.core.activation_policy.recompute.checkpointing import CheckpointWithoutOutput
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
     _make_gtp_linear,
     _make_gtp_remat_grouped_linear,

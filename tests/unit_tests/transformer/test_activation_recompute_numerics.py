@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from megatron.core.activation_policy import strategies as activation_policy_strategies
+from megatron.core.activation_policy.recompute import checkpointing as checkpointing_module
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_mtp_block_spec,
@@ -23,7 +24,6 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer import utils as transformer_utils
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
@@ -275,7 +275,7 @@ class TestActivationRecomputeNumerics:
         """
         calls = []
         primitives = []
-        real_checkpoint = transformer_utils.precision_aware_checkpoint
+        real_checkpoint = checkpointing_module.precision_aware_checkpoint
 
         for site, module in _CALL_SITE_MODULES.items():
 

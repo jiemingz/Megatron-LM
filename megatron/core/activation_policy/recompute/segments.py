@@ -104,7 +104,7 @@ class RecomputeSegment:
         the caller's ``f_input`` and is what the next segment captures, so it survives.
 
         Only the Python references are dropped. Resizing the storages (what
-        ``ScheduleNode``'s ``free_input`` path and ``tensor_parallel.random.checkpoint``
+        ``ScheduleNode``'s ``free_input`` path and ``checkpointing.checkpoint``
         do) is not usable here: the replay rebuilds the graph on top of these very
         tensors, and freeing their storage corrupts it.
         """

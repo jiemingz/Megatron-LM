@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import torch
 
-from megatron.core.activation_policy.offload.manager import FineGrainedActivationOffloadingInterface
+from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface,
+)
 
 _PARAMS_EXCLUDED_ATTR = "_activation_offload_params_excluded"
 

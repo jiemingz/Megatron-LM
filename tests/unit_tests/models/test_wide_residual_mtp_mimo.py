@@ -6,7 +6,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-import megatron.core.transformer.residual_recompute as residual_recompute_module
+import megatron.core.activation_policy.recompute.residual_recompute as residual_recompute_module
 from megatron.core.models.hybrid.hybrid_layer_specs import wide_residual_hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock

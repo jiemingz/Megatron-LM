@@ -22,7 +22,7 @@ from megatron.core.activation_policy import (
 )
 from megatron.core.activation_policy import runtime as runtime_module
 from megatron.core.activation_policy import strategies as strategies_module
-from megatron.core.activation_policy.recompute import replay as replay_module
+from megatron.core.activation_policy.recompute import residual_recompute as replay_module
 from megatron.core.tensor_parallel.random import initialize_rng_tracker
 from megatron.core.transformer.module import _ModulePointHook
 from tests.unit_tests.test_utilities import Utils, install_residual_replay

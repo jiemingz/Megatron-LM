@@ -577,31 +577,3 @@ def _fork_rng():
     finally:
         # Set the states back to what it was at the start of this function.
         _set_all_rng_states(*current_states)
-
-
-# Recompute primitives live in megatron.core.activation_policy.recompute.checkpointing; they are
-# re-exported here under their historical import path. Mutable module state (the checkpointing
-# flag, the storage-sharing extension) is not re-exported: a re-exported copy would never update.
-# Use is_checkpointing() and _get_share_storage().
-from megatron.core.activation_policy.recompute.checkpointing import (  # noqa: E402  pylint: disable=wrong-import-position,unused-import
-    _CHECKPOINT_WITHOUT_OUTPUT_STORAGE_ATTR,
-    _SHARE_STORAGE_SRC,
-    CheckpointFunction,
-    CheckpointWithoutOutput,
-    CheckpointWithoutOutputManager,
-    _ArgLayout,
-    _as_tuple,
-    _get_checkpoint_without_output_storage,
-    _get_share_storage,
-    _InputStash,
-    _mark_checkpoint_without_output_tensor,
-    _RecomputeRegion,
-    _RegionFunction,
-    _RegionState,
-    _register_rebuild_hook,
-    _set_checkpointing,
-    _unset_checkpointing,
-    checkpoint,
-    is_checkpoint_without_output_tensor,
-    is_checkpointing,
-)

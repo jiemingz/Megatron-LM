@@ -601,10 +601,3 @@ def is_layer_window_attention(
         f"Invalid `window_attn_skip_freq`: {type(window_attn_skip_freq)}, "
         f"{window_attn_skip_freq}"
     )
-
-
-# The checkpoint implementation lives with the other recompute primitives; re-exported here under
-# its historical import path.
-from megatron.core.activation_policy.recompute.checkpointing import (  # noqa: E402  pylint: disable=wrong-import-position,unused-import
-    precision_aware_checkpoint,
-)

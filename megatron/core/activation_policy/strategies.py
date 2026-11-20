@@ -46,7 +46,7 @@ from megatron.core.utils import make_viewless_tensor
 
 
 def _offload_interface():
-    from megatron.core.activation_policy.offload.manager import (
+    from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
         FineGrainedActivationOffloadingInterface,
     )
 

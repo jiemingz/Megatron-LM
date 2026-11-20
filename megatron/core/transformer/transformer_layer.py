@@ -69,7 +69,7 @@ logger = logging.getLogger(__name__)
 def _get_offloading_interface():
     """Get the offloading interface for fine-grained activation offloading."""
     # Keep this import lazy to avoid a transformer/pipeline circular import.
-    from megatron.core.activation_policy.offload.manager import (
+    from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
         FineGrainedActivationOffloadingInterface,
     )
 

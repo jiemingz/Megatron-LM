@@ -13,13 +13,13 @@ from megatron.core.activation_policy import (
     has_strategy,
     installed_strategies,
 )
-from megatron.core.activation_policy.recompute import replay as replay_module
-from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.random import (
+from megatron.core.activation_policy.recompute import residual_recompute as replay_module
+from megatron.core.activation_policy.recompute.checkpointing import (
     CheckpointWithoutOutput,
     CheckpointWithoutOutputManager,
-    initialize_rng_tracker,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import initialize_rng_tracker
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock, TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig

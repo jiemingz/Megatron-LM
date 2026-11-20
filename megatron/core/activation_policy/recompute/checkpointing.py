@@ -10,8 +10,7 @@
   of them can share a :class:`CheckpointWithoutOutputManager` and be released and rebuilt
   together (block replay).
 
-These are the implementations behind the activation strategies. ``megatron.core.tensor_parallel``
-re-exports them under their historical names.
+These are the implementations behind the activation strategies.
 """
 
 from __future__ import annotations
@@ -50,7 +49,7 @@ if TYPE_CHECKING:
 
 def _tp_random():
     # RNG state handling lives with the RNG trackers; imported at call time because
-    # ``megatron.core.tensor_parallel`` re-exports this module.
+    # ``megatron.core.tensor_parallel`` (its layers) imports the activation policy.
     from megatron.core.tensor_parallel import random
 
     return random

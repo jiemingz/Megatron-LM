@@ -19,7 +19,14 @@ from megatron.core.activation_policy import (
     install_activation_strategies,
 )
 from megatron.core.activation_policy import strategies as activation_policy_strategies
+from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface,
+    PipelineOffloadManager,
+)
 from megatron.core.activation_policy.recompute.checkpointing import CheckpointWithoutOutputManager
+from megatron.core.activation_policy.recompute.residual_recompute import (
+    build_recompute_block_end_plan,
+)
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
@@ -31,10 +38,6 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
     wide_residual_hybrid_stack_spec,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    FineGrainedActivationOffloadingInterface,
-    PipelineOffloadManager,
-)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.wide_residual_mamba_layer import WideResidualMambaLayer
@@ -44,7 +47,6 @@ from megatron.core.transformer.residual_connection import (
     ResidualConnection,
     ResidualConnectionState,
 )
-from megatron.core.transformer.residual_recompute import build_recompute_block_end_plan
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules

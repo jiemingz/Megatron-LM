@@ -5,11 +5,13 @@ import contextlib
 import pytest
 import torch
 
-from megatron.core.tensor_parallel.random import (
+from megatron.core.activation_policy.recompute.checkpointing import (
     CheckpointWithoutOutput,
     CheckpointWithoutOutputManager,
-    CudaRNGStatesTracker,
     checkpoint,
+)
+from megatron.core.tensor_parallel.random import (
+    CudaRNGStatesTracker,
     convert_cuda_rng_state,
     cudagraph_needs_generator_registration,
     get_cuda_rng_tracker,

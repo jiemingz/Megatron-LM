@@ -12,17 +12,17 @@ The mechanisms behind the strategies live in two subpackages: :mod:`.recompute` 
 output-discarding recompute and block replay) and :mod:`.offload` (fine-grained activation
 offloading).
 
-Attributes are imported on first use: ``megatron.core.tensor_parallel`` re-exports
-:mod:`.recompute.checkpointing`, so importing this package must not import model code.
+Attributes are imported on first use, so importing this package (for example from
+``megatron.core.tensor_parallel``, which checkpointing uses) does not import model code.
 """
 
 import importlib
 
 _EXPORTS = {
     "Event": "strategies",
-    "ReplayRegion": "recompute.replay",
-    "ResidualBranch": "recompute.replay",
-    "ResidualReplayStrategy": "recompute.replay",
+    "ReplayRegion": "recompute.residual_recompute",
+    "ResidualBranch": "recompute.residual_recompute",
+    "ResidualReplayStrategy": "recompute.residual_recompute",
     "TensorRef": "strategies",
     "CheckpointStrategy": "strategies",
     "CheckpointWithoutOutputStrategy": "strategies",

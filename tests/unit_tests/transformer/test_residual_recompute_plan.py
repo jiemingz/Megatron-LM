@@ -13,8 +13,8 @@ from megatron.core.activation_policy import (
     ResidualReplayStrategy,
     install_activation_strategies,
 )
-from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
-from megatron.core.transformer import residual_recompute
+from megatron.core.activation_policy.recompute import residual_recompute
+from megatron.core.activation_policy.recompute.checkpointing import CheckpointWithoutOutputManager
 
 
 @pytest.mark.parametrize(
@@ -139,7 +139,7 @@ def test_replay_strategy_rejects_sizes_disallowed_by_config(block_size):
 def test_replay_blocks_get_fresh_managers_every_forward(monkeypatch, num_layers, block_size):
     """Each block records into one manager, created by its first replayed region of a forward and
     released when the step that ends the block returns."""
-    from megatron.core.activation_policy.recompute import replay as replay_module
+    from megatron.core.activation_policy.recompute import residual_recompute as replay_module
 
     created = []
 
@@ -160,7 +160,7 @@ def test_replay_blocks_get_fresh_managers_every_forward(monkeypatch, num_layers,
 
 @pytest.mark.parametrize("training,grad", [(False, True), (True, False)])
 def test_replay_is_off_in_eval_and_without_grad(monkeypatch, training, grad):
-    from megatron.core.activation_policy.recompute import replay as replay_module
+    from megatron.core.activation_policy.recompute import residual_recompute as replay_module
 
     constructor = Mock(wraps=CheckpointWithoutOutputManager)
     monkeypatch.setattr(replay_module, "CheckpointWithoutOutputManager", constructor)

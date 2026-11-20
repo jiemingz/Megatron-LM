@@ -1406,7 +1406,7 @@ class TestMHCWithOffloading:
         the mHC forward path, including the group_commit that commits the
         offloading group for the aggregated 1-stream layernorm input.
         """
-        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
             PipelineOffloadManager,
         )
 
@@ -1450,7 +1450,7 @@ class TestMHCWithOffloading:
         Compares outputs and gradients between a layer with offloading disabled
         vs enabled to ensure the offloading path does not corrupt activations.
         """
-        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
             PipelineOffloadManager,
         )
 
